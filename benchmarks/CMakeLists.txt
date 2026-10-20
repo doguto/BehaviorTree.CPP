@@ -39,3 +39,11 @@ target_include_directories(bt_membench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(bt_latency bench_latency.cpp)
 target_link_libraries(bt_latency PRIVATE ${BTCPP_LIBRARY})
 target_include_directories(bt_latency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Per-tick latency of an application's XML trees, with stub nodes
+add_executable(bt_xml_latency bench_xml_latency.cpp)
+target_link_libraries(bt_xml_latency PRIVATE ${BTCPP_LIBRARY} tinyxml2::tinyxml2)
+target_include_directories(bt_xml_latency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(BTCPP_GROOT_INTERFACE)
+  target_compile_definitions(bt_xml_latency PRIVATE BENCH_WITH_GROOT2)
+endif()

@@ -1,11 +1,12 @@
 # BehaviorTree.CPP benchmarks
 
-Three executables, all disabled by default (`-DBTCPP_BUILD_BENCHMARKS=ON`):
+Four executables, all disabled by default (`-DBTCPP_BUILD_BENCHMARKS=ON`):
 
 | Target | What it measures |
 |--------|------------------|
 | `bt_bench` | Average time of isolated operations (Google Benchmark, fetched automatically if not installed) |
 | `bt_latency` | Distribution of the time of single ticks, with cold caches, periodic ticking and a fragmented heap |
+| `bt_xml_latency` | Same distribution, for **your own application's XML trees**, with stub nodes |
 | `bt_membench` | Heap footprint per node and heap allocations per steady-state tick |
 
 `bt_bench` ticks a small tree back-to-back: the tree stays in L1/L2 and its
@@ -55,6 +56,44 @@ moved between rounds: if it is large, the number is not trustworthy.
 Choose `--evict-mb` larger than the last-level cache of the machine to measure
 a fully cold tick (DRAM). On a Raspberry Pi 4 (1 MB L2, no L3) the default
 already does that. On big x86 servers the L3 can be hundreds of MB.
+
+## Your application's trees (`bench_xml_latency.cpp`)
+
+```bash
+bt_xml_latency --xml=subtrees.xml,main.xml --main=MainTree,OtherTree \
+               --period-us=500 [--set=key=value,...] [--groot2] \
+               [--writer-keys=k1,k2 --writer-hz=1000] [latency options]
+```
+
+The XML files are registered in the given order (`<include>` is followed).
+Every node that is not built into BT.CPP is replaced by a stub with the type and
+ports declared in the `<TreeNodesModel>` of the files (Groot2 writes it; or
+generate it from your real factory with `BT::writeTreeNodesModelXML()` and pass
+it with `--models`):
+
+- Action: reads its inputs and writes its outputs back on every tick, stays
+  RUNNING `--running-ticks` ticks (default 1), then SUCCESS.
+- Condition: touches its ports, SUCCESS. Decorator: touches its ports, returns
+  its child's status.
+- `Delay` / `Sleep` wait `--delay-scale` ticks per millisecond (default 0.1)
+  instead of wall-clock time, so the number of samples spent waiting does not
+  depend on the tick speed. Delays used as timeouts still last longer than
+  the action stubs. `--real-delays` keeps the real nodes.
+
+Keys referenced by ports and scripts are seeded with 0. Data-dependent branches
+(Switch, Precondition, loop bounds) may need other values to go anywhere
+interesting: `--set=line_id=1,plan_size=3`. Use `--trace=N` to print which
+leaves are RUNNING over N ticks and check how far the stubbed application gets.
+
+`--groot2` attaches a Groot2Publisher (it subscribes to every node's status
+changes) and `--writer-keys` adds a thread writing keys of the root blackboard
+like a ROS topic monitor: use them if your deployed application does that.
+
+What it measures is the library overhead on the real tree shape. The work of
+the real nodes (ROS calls, computation) is not included, and the proportion of
+"waiting" ticks vs "transition" ticks depends on `--running-ticks` and
+`--delay-scale`: look at the whole distribution (p90/p99 are the busy ticks),
+not only at p50.
 
 ## Workflow
 

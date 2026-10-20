@@ -198,3 +198,37 @@ TEST(TickHooks, WaitValidStatusIsWokenUpByTick)
   EXPECT_EQ(leaf->waitValidStatus(), NodeStatus::RUNNING);
   tree.haltTree();
 }
+
+TEST(TickHooks, WaitValidStatusStress)
+{
+  // A waiter starting at the same time as the status changes must never miss
+  // the change (it would block until the timeout).
+  BehaviorTreeFactory factory;
+  factory.registerNodeType<KeepRunning>("KeepRunning");
+  auto tree = factory.createTreeFromText(R"(
+<root BTCPP_format="4">
+  <BehaviorTree ID="Main">
+    <Sequence>
+      <KeepRunning name="leaf"/>
+    </Sequence>
+  </BehaviorTree>
+</root>)");
+  auto* leaf = findNode(tree, "leaf");
+  ASSERT_NE(leaf, nullptr);
+
+  for(int i = 0; i < 300; i++)
+  {
+    ASSERT_EQ(leaf->status(), NodeStatus::IDLE);
+    auto waiter =
+        std::async(std::launch::async, [leaf] { return leaf->waitValidStatus(); });
+    if(i % 3 == 1)
+    {
+      std::this_thread::yield();
+    }
+    ASSERT_EQ(tree.tickExactlyOnce(), NodeStatus::RUNNING);
+    ASSERT_EQ(waiter.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+        << "iteration " << i;
+    EXPECT_EQ(waiter.get(), NodeStatus::RUNNING);
+    tree.haltTree();
+  }
+}

@@ -34,3 +34,8 @@ target_include_directories(bt_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(bt_membench bench_memory.cpp)
 target_link_libraries(bt_membench PRIVATE ${BTCPP_LIBRARY})
 target_include_directories(bt_membench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Per-tick latency distribution under cold-cache / periodic / fragmented conditions
+add_executable(bt_latency bench_latency.cpp)
+target_link_libraries(bt_latency PRIVATE ${BTCPP_LIBRARY})
+target_include_directories(bt_latency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

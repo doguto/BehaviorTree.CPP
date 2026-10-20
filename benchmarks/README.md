@@ -1,11 +1,17 @@
 # BehaviorTree.CPP benchmarks
 
-Two executables, both disabled by default (`-DBTCPP_BUILD_BENCHMARKS=ON`):
+Three executables, all disabled by default (`-DBTCPP_BUILD_BENCHMARKS=ON`):
 
 | Target | What it measures |
 |--------|------------------|
-| `bt_bench` | Time (Google Benchmark, fetched automatically if not installed) |
+| `bt_bench` | Average time of isolated operations (Google Benchmark, fetched automatically if not installed) |
+| `bt_latency` | Distribution of the time of single ticks, with cold caches, periodic ticking and a fragmented heap |
 | `bt_membench` | Heap footprint per node and heap allocations per steady-state tick |
+
+`bt_bench` ticks a small tree back-to-back: the tree stays in L1/L2 and its
+numbers are a **best case**, useful to compare code changes on a specific path.
+`bt_latency` is closer to what a robot sees and should be the reference for
+"how long does a tick take".
 
 `bt_membench` replaces the global `operator new/delete`, so it counts every C++
 allocation made by the library. It reports `0` allocations per tick for the
@@ -24,6 +30,31 @@ Tick benchmarks report `items_per_second` = nodes ticked per second, so trees of
 different size are comparable. Every benchmark checks the status of its first
 tick and aborts (`SkipWithError`) if the tree does not behave as intended, so a
 number can never silently measure an early-failing tree.
+
+## Latency benchmark (`bench_latency.cpp`)
+
+Trees: `Seq100` (100 trivial leaves), `Ports100` (100 blackboard reads) and
+`Robot2k` (100 SubTree instances, ~2100 nodes with ports, scripts, decorators,
+Parallel and reactive nodes).
+
+Conditions, applied before each timed tick (never timed themselves):
+
+| Condition | Meaning |
+|-----------|---------|
+| `hot` | back-to-back ticks, same as `bt_bench` |
+| `evict` | write `--evict-mb` (default 32 MB) to push the tree out of the caches |
+| `periodic` | sleep `--period-us` (default 1 ms), like a control loop |
+| `frag` | like `evict`, but the tree is built after fragmenting the heap, so nodes are scattered in memory as in a long-running process |
+
+For every scenario it prints p50 / p90 / p99 / p99.9 / max and a log-scale
+histogram. Each scenario runs `--rounds` times on a fresh tree; the reported
+statistics are medians across rounds and `*_spread_pct` tells how much p50/p99
+moved between rounds: if it is large, the number is not trustworthy.
+`--csv-dir` dumps every sample for plotting.
+
+Choose `--evict-mb` larger than the last-level cache of the machine to measure
+a fully cold tick (DRAM). On a Raspberry Pi 4 (1 MB L2, no L3) the default
+already does that. On big x86 servers the L3 can be hundreds of MB.
 
 ## Workflow
 
@@ -60,4 +91,11 @@ cmake --build build --target bt_bench bt_membench
   `compare.py` on two runs of the *same* commit first to see your noise floor,
   and only trust changes above it. Allocation counts in `memory.json` are
   deterministic and are not affected by noise.
+- For `bt_latency`, only p50 is reproducible: on the same VM, p50 moved by ~3%
+  between runs of the same commit (~16% in `periodic` mode), p90 and mean by up
+  to 50%, the maximum by up to 400%. `compare.py` therefore gates only on p50
+  and prints the other statistics as information. Tails are meaningful only on
+  a quiet, dedicated machine (ideally the robot itself, with an isolated core).
+- When comparing two commits, interleave runs (base, new, base, new) to cancel
+  slow drifts of the host.
 - Close other workloads, disable CPU frequency scaling if you can.

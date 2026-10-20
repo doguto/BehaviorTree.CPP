@@ -168,6 +168,38 @@ inline std::string nested(const std::string& control, int depth,
   return wrapTree(s.str());
 }
 
+// A larger tree shaped like a real robot application: `tasks` SubTree instances
+// (own blackboard, remapped ports), each mixing control nodes, decorators,
+// port reads/writes and script pre-conditions. Every tick returns SUCCESS and
+// visits all ~21 nodes of each task.
+inline std::string robotLikeTree(int tasks)
+{
+  std::ostringstream s;
+  s << "<root BTCPP_format=\"4\" main_tree_to_execute=\"MainTree\">"
+       "<BehaviorTree ID=\"MainTree\"><Sequence>";
+  for(int i = 0; i < tasks; i++)
+  {
+    s << "<SubTree ID=\"Task\" x=\"{x}\" s=\"{s}\"/>";
+  }
+  s << "</Sequence></BehaviorTree>"
+       "<BehaviorTree ID=\"Task\"><Sequence>"
+       "<Fallback><Fail/><Inverter><Ok/></Inverter><ReadInt value=\"{x}\"/></Fallback>"
+       "<ReadString value=\"{s}\"/>"
+       "<WriteInt value=\"{y}\"/>"
+       "<Sequence><Ok/><ReadInt value=\"{y}\"/><Ok _skipIf=\"x &gt; 1000\"/></Sequence>"
+       "<ForceSuccess><Fail/></ForceSuccess>"
+       "<Parallel><Ok/><Ok/><ReadInt value=\"5\"/></Parallel>"
+       "<ReactiveSequence><Ok/><ReadInt value=\"{x}\"/></ReactiveSequence>"
+       "</Sequence></BehaviorTree></root>";
+  return s.str();
+}
+
+inline void setupRobotBlackboard(BT::Blackboard& bb)
+{
+  bb.set("x", 1);
+  bb.set("s", std::string("a string value long enough to need a heap buffer"));
+}
+
 inline BT::Tree makeTree(BT::BehaviorTreeFactory& f, const std::string& xml,
                          BT::Blackboard::Ptr bb = {})
 {

@@ -3,7 +3,8 @@
 
     compare.py <base> <new> [--threshold PCT]
 
-<base>/<new> are result directories (time.json + memory.json) or single JSON files.
+<base>/<new> are result directories (time.json, memory.json, latency.json)
+or single JSON files.
 Lower is better for every metric. Uses only the standard library.
 """
 import argparse
@@ -40,13 +41,23 @@ def load_memory(path):
     return out
 
 
+def load_latency(path):
+    """Only the statistics: the *_spread_pct values describe noise, not speed."""
+    return {k: v for k, v in load_memory(path).items() if "spread" not in k}
+
+
 def collect(p):
     if os.path.isdir(p):
-        t, m = os.path.join(p, "time.json"), os.path.join(p, "memory.json")
-        return (load_time(t) if os.path.exists(t) else {},
-                load_memory(m) if os.path.exists(m) else {})
+        files = [("time.json", load_time), ("memory.json", load_memory),
+                 ("latency.json", load_latency)]
+        return tuple(fn(os.path.join(p, f)) if os.path.exists(os.path.join(p, f)) else {}
+                     for f, fn in files)
     d = json.load(open(p))
-    return (load_time(p), {}) if "benchmarks" in d else ({}, load_memory(p))
+    if "benchmarks" in d:
+        return load_time(p), {}, {}
+    if "context" in d:
+        return {}, {}, load_latency(p)
+    return {}, load_memory(p), {}
 
 
 def fmt_time(ns):
@@ -56,7 +67,14 @@ def fmt_time(ns):
     return f"{ns:.1f} ns"
 
 
-def table(title, base, new, fmt, threshold):
+# Only the median of the latency distribution is stable between runs (measured:
+# ~3% between two runs of the same commit, while p90/mean moved up to 50% and the
+# max up to 400%). The other statistics are shown but never count as regressions.
+def latency_gate(name):
+    return "[p50_ns]" in name
+
+
+def table(title, base, new, fmt, threshold, gate=lambda name: True):
     names = [n for n in base if n in new]
     if not names:
         return 0
@@ -70,7 +88,9 @@ def table(title, base, new, fmt, threshold):
             continue
         pct = (v - b) / b * 100 if b else float("inf")
         mark = ""
-        if pct > threshold:
+        if not gate(n):
+            mark = "  (info)" if abs(pct) > threshold else ""
+        elif pct > threshold:
             mark, regress = "  SLOWER" if title.startswith("Time") else "  WORSE", regress + 1
         elif pct < -threshold:
             mark = "  better"
@@ -85,10 +105,12 @@ def main():
     ap.add_argument("--threshold", type=float, default=10.0,
                     help="percent change to flag (default 10)")
     a = ap.parse_args()
-    bt, bm = collect(a.base)
-    nt, nm = collect(a.new)
+    bt, bm, bl = collect(a.base)
+    nt, nm, nl = collect(a.new)
     r = table("Time (cpu, median)", bt, nt, fmt_time, a.threshold)
     r += table("Memory / allocations", bm, nm, lambda x: f"{x:,.1f}", a.threshold)
+    r += table("Time: per-tick latency (wall)", bl, nl, fmt_time, a.threshold,
+               latency_gate)
     print(f"\n{r} metric(s) worse than +{a.threshold}%")
     return 1 if r else 0
 

@@ -19,7 +19,7 @@ cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release \
   -DBTCPP_BUILD_BENCHMARKS=ON -DBUILD_TESTING=OFF -DBTCPP_EXAMPLES=OFF \
   -DBTCPP_BUILD_TOOLS=OFF -DBTCPP_GROOT_INTERFACE=OFF -DBTCPP_SQLITE_LOGGING=OFF \
   >/dev/null
-cmake --build "$BUILD" --parallel --target bt_bench bt_membench
+cmake --build "$BUILD" --parallel --target bt_bench bt_membench bt_latency
 
 mkdir -p "$OUT"
 
@@ -37,6 +37,10 @@ fi
   --benchmark_format=console
 
 "$BUILD/benchmarks/bt_membench" --json="$OUT/memory.json"
+
+mkdir -p "$OUT/latency_csv"
+"${PIN[@]}" "$BUILD/benchmarks/bt_latency" \
+  --json="$OUT/latency.json" --csv-dir="$OUT/latency_csv" ${BT_LATENCY_ARGS:-}
 
 {
   echo "commit: $(git -C "$ROOT" rev-parse --short HEAD) $(git -C "$ROOT" status --porcelain | grep -q . && echo '(dirty)')"

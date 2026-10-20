@@ -172,13 +172,11 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
     : config(std::move(config)), name(std::move(name))
   {}
 
-  //---------- hot: used by every tick ----------
+  //---------- hot: used by every tick, all in the first cache line ----------
 
   // The status is read and written without lock. state_mutex is only used to
   // wake up the threads blocked in waitValidStatus(), see notifyStatusChange().
   std::atomic<NodeStatus> status{ NodeStatus::IDLE };
-
-  mutable std::mutex state_mutex;
 
   // True when at least one injected callback is set. Written while holding
   // callback_injection_mutex; lets executeTick() skip that mutex otherwise.
@@ -191,10 +189,6 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
   // writer sees the waiter and notifies it under state_mutex.
   std::atomic<int> status_waiters{ 0 };
 
-  StatusChangeSignal state_change_signal;
-
-  std::shared_ptr<WakeUpSignal> wake_up;
-
   // Pre/post condition scripts. Allocated only when requested by
   // preConditionsScripts() / postConditionsScripts() (the only way to set them):
   // most nodes have none, and executeTick() then skips them entirely.
@@ -204,6 +198,13 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
     PostScripts post;
   };
   std::unique_ptr<ConditionScripts> scripts;
+
+  StatusChangeSignal state_change_signal;
+
+  std::shared_ptr<WakeUpSignal> wake_up;
+
+  //---------- used when a thread waits for the status ----------
+  mutable std::mutex state_mutex;
 
   //---------- used by ports and introspection ----------
   NodeConfig config;

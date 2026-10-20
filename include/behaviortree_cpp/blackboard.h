@@ -247,6 +247,15 @@ inline T Blackboard::get(const std::string& key) const
       throw RuntimeError("Blackboard::get() error. Entry [", key,
                          "] hasn't been initialized, yet");
     }
+    if constexpr(!std::is_same_v<T, float>)
+    {
+      // Stored with exactly this type: copy it directly, without the
+      // intermediate copies of tryCast()
+      if(const T* direct = any_ref->template castPtr<T>())
+      {
+        return *direct;
+      }
+    }
     auto result = tryCastWithPolymorphicFallback<T>(any);
     if(!result)
     {
@@ -424,6 +433,16 @@ inline bool Blackboard::get(const std::string& key, T& value) const
     if(any->empty())
     {
       return false;
+    }
+    if constexpr(!std::is_same_v<T, float>)
+    {
+      // Stored with exactly this type: copy it directly, without the
+      // intermediate copies of tryCast()
+      if(const T* direct = any_ref->template castPtr<T>())
+      {
+        value = *direct;
+        return true;
+      }
     }
     auto result = tryCastWithPolymorphicFallback<T>(any);
     if(!result)

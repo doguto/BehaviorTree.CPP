@@ -21,6 +21,7 @@ set(BT_TESTS
   gtest_any.cpp
   gtest_basic_types.cpp
   gtest_blackboard.cpp
+  gtest_blackboard_remapped_set.cpp
   gtest_coroutines.cpp
   gtest_decorator.cpp
   gtest_enums.cpp

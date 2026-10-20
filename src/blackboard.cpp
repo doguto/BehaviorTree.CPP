@@ -279,6 +279,33 @@ Blackboard::Ptr Blackboard::parent()
   return {};
 }
 
+std::shared_ptr<Blackboard::Entry>
+Blackboard::findRemappedEntry(const std::string& key) const
+{
+  // same lookup order as createEntryImpl()
+  {
+    const std::shared_lock storage_lock(storage_mutex_);
+    if(auto it = storage_.find(key); it != storage_.end())
+    {
+      return it->second;
+    }
+  }
+  auto parent = parent_bb_.lock();
+  if(!parent)
+  {
+    return {};
+  }
+  if(auto it = internal_to_external_.find(key); it != internal_to_external_.end())
+  {
+    return parent->findRemappedEntry(it->second);
+  }
+  if(autoremapping_ && !IsPrivateKey(key))
+  {
+    return parent->findRemappedEntry(key);
+  }
+  return {};
+}
+
 std::shared_ptr<Blackboard::Entry> Blackboard::createEntryImpl(const std::string& key,
                                                                const TypeInfo& info)
 {

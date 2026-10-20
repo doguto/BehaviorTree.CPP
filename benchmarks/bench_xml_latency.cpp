@@ -27,12 +27,15 @@
 // Usage: bt_xml_latency --xml=a.xml,b.xml --main=TreeID [--models=m.xml,...]
 //                       [--running-ticks=N] [--writer-keys=k1,k2] [--writer-hz=N]
 //                       [--set=key=value,...] [--delay-scale=F] [--real-delays]
-//                       [--shared-timer] [--groot2[=PORT]] [--trace=N]
+//                       [--shared-timer] [--typed-ports] [--groot2[=PORT]] [--trace=N]
 //                       [latency options]
 // --trace=N only ticks N times, printing the RUNNING leaves when they change.
 // --real-delays keeps the built-in Delay/Sleep nodes. Otherwise they wait
 // --delay-scale ticks per millisecond (default 0.1, i.e. 2000 ms -> 200 ticks).
 // --shared-timer: BehaviorTreeFactory::useSharedTimerThread() (with --real-delays).
+// --typed-ports: the ports of the stubs get a type guessed from the literals given
+// in the trees (number -> double, true/false -> bool, other -> string), like the
+// typed ports of real nodes. Without it they are generic.
 #include "latency_harness.h"
 
 #include "behaviortree_cpp/decorator_node.h"
@@ -312,7 +315,83 @@ struct ParsedFiles
   // keys assigned by a script (`key := ...`): the script creates them with the
   // right type, so they are not seeded
   std::set<std::string> assigned;
+  // kinds of the literals given to each port of each node type in the trees
+  // ('n'umber, 'b'ool, 's'tring), to guess the type of the port (--typed-ports)
+  std::map<std::string, std::map<std::string, std::set<char>>> literal_kinds;
 };
+
+// Same guess as PortToucher::kindOf()
+char literalKind(const std::string& value)
+{
+  if(value == "true" || value == "false")
+  {
+    return 'b';
+  }
+  char* end = nullptr;
+  (void)std::strtod(value.c_str(), &end);
+  return (!value.empty() && *end == '\0') ? 'n' : 's';
+}
+
+void collectLiterals(const tinyxml2::XMLElement* el, ParsedFiles& out)
+{
+  const std::string tag = el->Name();
+  const char* id =
+      (tag == "Action" || tag == "Condition" || tag == "Decorator" || tag == "Control") ?
+          el->Attribute("ID") :
+          el->Name();
+  for(auto a = el->FirstAttribute(); a && id; a = a->Next())
+  {
+    const std::string name = a->Name();
+    const std::string value = a->Value();
+    if(name == "name" || name == "ID" || name.empty() || name[0] == '_' || value == "=" ||
+       BT::TreeNode::isBlackboardPointer(value))
+    {
+      continue;
+    }
+    out.literal_kinds[id][name].insert(literalKind(value));
+  }
+  for(auto child = el->FirstChildElement(); child; child = child->NextSiblingElement())
+  {
+    collectLiterals(child, out);
+  }
+}
+
+// Real nodes declare the type of their ports (InputPort<double>(...)), the
+// TreeNodesModel doesn't: guess it from the literals given in the trees.
+void guessPortTypes(ParsedFiles& parsed)
+{
+  for(auto& [id, manifest] : parsed.models)
+  {
+    for(auto& [name, info] : manifest.ports)
+    {
+      if(info.direction() == BT::PortDirection::OUTPUT)
+      {
+        continue;
+      }
+      const auto& kinds = parsed.literal_kinds[id][name];
+      if(kinds.empty())
+      {
+        continue;  // only blackboard entries: generic port
+      }
+      const bool inout = info.direction() == BT::PortDirection::INOUT;
+      if(kinds == std::set<char>{ 'n' })
+      {
+        info = inout ? BT::BidirectionalPort<double>(name).second :
+                       BT::InputPort<double>(name).second;
+      }
+      else if(kinds == std::set<char>{ 'b' })
+      {
+        info = inout ? BT::BidirectionalPort<bool>(name).second :
+                       BT::InputPort<bool>(name).second;
+      }
+      else
+      {
+        info = inout ? BT::BidirectionalPort<std::string>(name).second :
+                       BT::InputPort<std::string>(name).second;
+      }
+    }
+  }
+}
 
 const std::set<std::string> kScriptAttributes = {
   "code",   "if",         "_skipIf",    "_failureIf", "_successIf",
@@ -382,6 +461,7 @@ void parseFile(const fs::path& path, ParsedFiles& out, std::set<fs::path>& visit
     else if(tag == "BehaviorTree" && el->Attribute("ID"))
     {
       collectKeys(el, out.keys[el->Attribute("ID")], out.assigned);
+      collectLiterals(el, out);
     }
     else if(tag == "TreeNodesModel")
     {
@@ -663,6 +743,7 @@ struct XmlOptions
   int writer_hz = 1000;
   int groot2_port = 0;
   int trace_ticks = 0;
+  bool typed_ports = false;
   std::map<std::string, std::string> overrides;
 };
 
@@ -765,6 +846,8 @@ int main(int argc, char** argv)
       xopt.stubs.real_delays = true;
     else if(a == "--shared-timer")
       xopt.stubs.shared_timer = true;
+    else if(a == "--typed-ports")
+      xopt.typed_ports = true;
     else if(auto v = value("--trace="))
       xopt.trace_ticks = std::atoi(v);
     else if(auto v = value("--groot2="))
@@ -801,6 +884,10 @@ int main(int argc, char** argv)
   for(const auto& f : xopt.model_files)
   {
     parseFile(f, parsed, visited);
+  }
+  if(xopt.typed_ports)
+  {
+    guessPortTypes(parsed);
   }
 
   // Report the shape of the trees once

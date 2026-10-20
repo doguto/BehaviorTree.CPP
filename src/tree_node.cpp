@@ -202,6 +202,53 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
 
   std::shared_ptr<WakeUpSignal> wake_up;
 
+  // The input ports, resolved from config by the first getInput() (see
+  // buildPortTable()) and discarded by mutableConfig().
+  // One arena block: the header, then the slots.
+  struct PortTable
+  {
+    size_t size = 0;
+
+    [[nodiscard]] details::PortSlot* slots()
+    {
+      return reinterpret_cast<details::PortSlot*>(this + 1);
+    }
+    [[nodiscard]] const details::PortSlot* slots() const
+    {
+      return reinterpret_cast<const details::PortSlot*>(this + 1);
+    }
+    static size_t bytes(size_t size)
+    {
+      return sizeof(PortTable) + size * sizeof(details::PortSlot);
+    }
+    static PortTable* create(size_t size)
+    {
+      static_assert(alignof(details::PortSlot) <= alignof(PortTable));
+      auto* table = new(NodeDataArena::allocate(bytes(size))) PortTable;
+      table->size = size;
+      for(size_t i = 0; i < size; i++)
+      {
+        new(table->slots() + i) details::PortSlot();
+      }
+      return table;
+    }
+    static void destroy(PortTable* table) noexcept
+    {
+      if(table == nullptr)
+      {
+        return;
+      }
+      const size_t size = table->size;
+      for(size_t i = 0; i < size; i++)
+      {
+        table->slots()[i].~PortSlot();
+      }
+      table->~PortTable();
+      NodeDataArena::deallocate(table, bytes(size));
+    }
+  };
+  mutable std::atomic<PortTable*> port_table{ nullptr };
+
   //---------- used when a thread waits for the status ----------
   mutable std::mutex state_mutex;
 
@@ -245,6 +292,19 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
     return callbacks &&
            (callbacks->pre_tick || callbacks->post_tick || callbacks->tick_monitor);
   }
+
+  ~PImpl()
+  {
+    dropPortTable();
+  }
+
+  void dropPortTable()
+  {
+    PortTable::destroy(port_table.exchange(nullptr, std::memory_order_acq_rel));
+  }
+
+  // Thread-safe: concurrent callers may build it twice, only one is kept.
+  const PortTable* buildPortTable() const;
 
   ConditionScripts& conditionScripts()
   {
@@ -353,6 +413,126 @@ void TreeNode::updateCallbacksFlag()
 }
 
 TreeNode::~TreeNode() = default;
+
+namespace
+{
+// Convert the literal once if the port is declared with type T.
+template <typename T>
+bool preconvertLiteral(const PortInfo& info, const std::string& literal,
+                       details::PortSlot& slot)
+{
+  static_assert(sizeof(T) <= sizeof(slot.literal_value));
+  if(info.type() != typeid(T))
+  {
+    return false;
+  }
+  try
+  {
+    const T value = convertFromString<T>(literal);
+    std::memcpy(slot.literal_value, &value, sizeof(T));
+    slot.literal_type = &typeid(T);
+  }
+  catch(const std::exception&)
+  {
+    // invalid literal: getInput() reports the error, as before
+  }
+  return true;
+}
+}  // namespace
+
+const TreeNode::PImpl::PortTable* TreeNode::PImpl::buildPortTable() const
+{
+  std::unique_ptr<PortTable, void (*)(PortTable*)> table(
+      PortTable::create(config.input_ports.size()), &PortTable::destroy);
+  size_t i = 0;
+  for(const auto& [name, value] : config.input_ports)
+  {
+    details::PortSlot& slot = table->slots()[i++];
+    slot.name = &name;
+    slot.value = &value;
+    slot.name_size = static_cast<uint32_t>(name.size());
+    slot.name_prefix = details::portNamePrefix(name);
+
+    StringView stripped;
+    if(value == "{=}" || value == "=")
+    {
+      slot.kind = details::PortSlot::Blackboard;
+      slot.blackboard_key = name;
+      continue;
+    }
+    if(TreeNode::isBlackboardPointer(value, &stripped))
+    {
+      slot.kind = details::PortSlot::Blackboard;
+      slot.blackboard_key = std::string(stripped);
+      continue;
+    }
+    const PortInfo* info = nullptr;
+    if(config.manifest)
+    {
+      auto it = config.manifest->ports.find(name);
+      info = it != config.manifest->ports.end() ? &it->second : nullptr;
+    }
+    // same conditions as getInput()
+    slot.string_identity =
+        info == nullptr || !info->converter() || info->type() == typeid(std::string);
+    if(info != nullptr && info->converter())
+    {
+      (void)(preconvertLiteral<bool>(*info, value, slot) ||
+             preconvertLiteral<double>(*info, value, slot) ||
+             preconvertLiteral<float>(*info, value, slot) ||
+             preconvertLiteral<int32_t>(*info, value, slot) ||
+             preconvertLiteral<uint32_t>(*info, value, slot) ||
+             preconvertLiteral<int64_t>(*info, value, slot) ||
+             preconvertLiteral<uint64_t>(*info, value, slot) ||
+             preconvertLiteral<int16_t>(*info, value, slot) ||
+             preconvertLiteral<uint16_t>(*info, value, slot) ||
+             preconvertLiteral<int8_t>(*info, value, slot) ||
+             preconvertLiteral<uint8_t>(*info, value, slot));
+    }
+  }
+
+  PortTable* expected = nullptr;
+  if(port_table.compare_exchange_strong(expected, table.get(), std::memory_order_acq_rel,
+                                        std::memory_order_acquire))
+  {
+    return table.release();
+  }
+  return expected;  // built by another thread meanwhile
+}
+
+void TreeNode::resolvePorts() const
+{
+  if(_p->port_table.load(std::memory_order_acquire) == nullptr)
+  {
+    (void)_p->buildPortTable();
+  }
+}
+
+void TreeNode::setManifest(const TreeNodeManifest* manifest)
+{
+  // same declarations: the resolved ports stay valid
+  _p->config.manifest = manifest;
+}
+
+const details::PortSlot* TreeNode::findPortSlot(const std::string& key) const
+{
+  const PImpl::PortTable* table = _p->port_table.load(std::memory_order_acquire);
+  if(table == nullptr)
+  {
+    table = _p->buildPortTable();
+  }
+  const uint64_t prefix = details::portNamePrefix(key);
+  for(size_t i = 0; i < table->size; i++)
+  {
+    const details::PortSlot& slot = table->slots()[i];
+    if(slot.name_size == key.size() && slot.name_prefix == prefix &&
+       (key.size() <= sizeof(prefix) || *slot.name == key))
+    {
+      return &slot;
+    }
+  }
+  return nullptr;
+}
 
 NodeStatus TreeNode::executeTick()
 {
@@ -727,8 +907,14 @@ const NodeConfig& TreeNode::config() const
   return _p->config;
 }
 
-NodeConfig& TreeNode::config()
+const NodeConfig& TreeNode::config()
 {
+  return _p->config;
+}
+
+NodeConfig& TreeNode::mutableConfig()
+{
+  _p->dropPortTable();
   return _p->config;
 }
 

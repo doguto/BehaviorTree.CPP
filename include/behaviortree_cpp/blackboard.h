@@ -213,7 +213,7 @@ inline Expected<T> Blackboard::tryCastWithPolymorphicFallback(const Any* any) co
   auto result = any->tryCast<T>();
   if(result)
   {
-    return result.value();
+    return std::move(result.value());
   }
 
   // For shared_ptr types, try polymorphic cast via registry (Issue #943)

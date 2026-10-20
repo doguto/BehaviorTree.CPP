@@ -1,6 +1,7 @@
 #pragma once
 
 #include "behaviortree_cpp/action_node.h"
+#include "behaviortree_cpp/utils/shared_timer_queue.h"
 #include "behaviortree_cpp/utils/timer_queue.h"
 
 #include <atomic>
@@ -17,6 +18,11 @@ class SleepNode : public StatefulActionNode
 {
 public:
   SleepNode(const std::string& name, const NodeConfig& config);
+
+  /// Uses `shared_timer`, when not null, instead of starting its own timer
+  /// thread (see BehaviorTreeFactory::useSharedTimerThread()).
+  SleepNode(const std::string& name, const NodeConfig& config,
+            std::shared_ptr<SharedTimerQueue> shared_timer);
 
   ~SleepNode() override
   {
@@ -40,7 +46,9 @@ public:
   }
 
 private:
-  TimerQueue<> timer_;
+  // Its own timer thread (default), or the shared one
+  std::unique_ptr<TimerQueue<>> timer_;
+  std::shared_ptr<SharedTimerQueue> shared_timer_;
   uint64_t timer_id_ = 0;
 
   std::atomic_bool timer_waiting_ = false;

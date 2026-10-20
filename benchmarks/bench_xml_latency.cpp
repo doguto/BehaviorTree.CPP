@@ -27,10 +27,12 @@
 // Usage: bt_xml_latency --xml=a.xml,b.xml --main=TreeID [--models=m.xml,...]
 //                       [--running-ticks=N] [--writer-keys=k1,k2] [--writer-hz=N]
 //                       [--set=key=value,...] [--delay-scale=F] [--real-delays]
-//                       [--groot2[=PORT]] [--trace=N] [latency options]
+//                       [--shared-timer] [--groot2[=PORT]] [--trace=N]
+//                       [latency options]
 // --trace=N only ticks N times, printing the RUNNING leaves when they change.
 // --real-delays keeps the built-in Delay/Sleep nodes. Otherwise they wait
 // --delay-scale ticks per millisecond (default 0.1, i.e. 2000 ms -> 200 ticks).
+// --shared-timer: BehaviorTreeFactory::useSharedTimerThread() (with --real-delays).
 #include "latency_harness.h"
 
 #include "behaviortree_cpp/decorator_node.h"
@@ -55,6 +57,7 @@ struct StubSettings
 {
   int running_ticks = 1;
   bool real_delays = false;
+  bool shared_timer = false;
   // Delay/Sleep stubs wait this many ticks per millisecond of their duration
   double delay_scale = 0.1;
 
@@ -419,6 +422,7 @@ size_t registerStubs(BT::BehaviorTreeFactory& factory, const ParsedFiles& parsed
                      const StubSettings& settings)
 {
   std::map<std::string, BT::TreeNodeManifest> to_stub = parsed.models;
+  factory.useSharedTimerThread(settings.shared_timer);
   if(!settings.real_delays)
   {
     // built-ins can't be unregistered: register the stub under another ID and
@@ -759,6 +763,8 @@ int main(int argc, char** argv)
       xopt.stubs.delay_scale = std::atof(v);
     else if(a == "--real-delays")
       xopt.stubs.real_delays = true;
+    else if(a == "--shared-timer")
+      xopt.stubs.shared_timer = true;
     else if(auto v = value("--trace="))
       xopt.trace_ticks = std::atoi(v);
     else if(auto v = value("--groot2="))
@@ -806,11 +812,15 @@ int main(int argc, char** argv)
     {
       factory.registerBehaviorTreeFromFile(f);
     }
+    const auto t1 = std::chrono::steady_clock::now();
     auto tree = factory.createTree(main_tree);
+    const auto t2 = std::chrono::steady_clock::now();
     size_t nodes = 0;
     tree.applyVisitor([&](BT::TreeNode*) { nodes++; });
-    std::printf("tree [%s]: %zu nodes, %zu subtree instances, %zu stub types\n",
-                main_tree.c_str(), nodes, tree.subtrees.size(), stubs);
+    std::printf("tree [%s]: %zu nodes, %zu subtree instances, %zu stub types, "
+                "created in %.2f ms\n",
+                main_tree.c_str(), nodes, tree.subtrees.size(), stubs,
+                std::chrono::duration<double, std::milli>(t2 - t1).count());
     if(xopt.trace_ticks > 0)
     {
       seedBlackboards(tree, parsed, xopt.overrides);

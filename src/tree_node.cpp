@@ -649,11 +649,6 @@ void TreeNode::resetStatus()
   }
 }
 
-NodeStatus TreeNode::status() const
-{
-  return status_.load(std::memory_order_acquire);
-}
-
 NodeStatus TreeNode::waitValidStatus()
 {
   std::unique_lock<std::mutex> lock(_p->state_mutex);
@@ -682,11 +677,6 @@ NodeStatus TreeNode::waitValidStatus()
 const std::string& TreeNode::name() const
 {
   return _p->name;
-}
-
-bool TreeNode::isHalted() const
-{
-  return status() == NodeStatus::IDLE;
 }
 
 TreeNode::StatusChangeSubscriber

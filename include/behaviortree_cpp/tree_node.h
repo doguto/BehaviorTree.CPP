@@ -201,9 +201,15 @@ public:
 
   void haltNode();
 
-  [[nodiscard]] bool isHalted() const;
+  [[nodiscard]] bool isHalted() const
+  {
+    return status() == NodeStatus::IDLE;
+  }
 
-  [[nodiscard]] NodeStatus status() const;
+  [[nodiscard]] NodeStatus status() const
+  {
+    return status_.load(std::memory_order_acquire);
+  }
 
   /// Name of the instance, not the type
   [[nodiscard]] const std::string& name() const;

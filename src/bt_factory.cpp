@@ -624,6 +624,9 @@ void Tree::remapManifestPointers()
 void Tree::initialize()
 {
   wake_up_ = std::make_shared<WakeUpSignal>();
+  root_ = (subtrees.empty() || subtrees.front()->nodes.empty()) ?
+              nullptr :
+              subtrees.front()->nodes.front();
   for(auto& subtree : subtrees)
   {
     for(auto& node : subtree->nodes)
@@ -727,12 +730,12 @@ NodeStatus Tree::tickRoot(TickOption opt, std::chrono::milliseconds sleep_time)
 {
   NodeStatus status = NodeStatus::IDLE;
 
-  if(!wake_up_)
+  if(!wake_up_ || !root_)
   {
     initialize();
   }
 
-  TreeNode* root = rootNode();
+  TreeNode* root = root_.get();
   if(root == nullptr)
   {
     throw RuntimeError("Empty Tree");

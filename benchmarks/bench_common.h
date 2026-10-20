@@ -138,8 +138,8 @@ inline std::string wrapTree(const std::string& body)
          body + "</BehaviorTree></root>";
 }
 
-inline std::string repeatLeaf(const std::string& control, const std::string& leaf,
-                              int n, const std::string& tail = "")
+inline std::string repeatLeaf(const std::string& control, const std::string& leaf, int n,
+                              const std::string& tail = "")
 {
   std::ostringstream s;
   s << "<" << control << ">";

@@ -79,8 +79,7 @@ void BM_Tick_PreCondition(benchmark::State& state)
   BT::BehaviorTreeFactory f;
   auto bb = BT::Blackboard::create();
   bb->set("x", 10);
-  auto tree = makeTree(
-      f, repeatLeaf("Sequence", "<Ok _skipIf=\"x &gt; 100\"/>", n), bb);
+  auto tree = makeTree(f, repeatLeaf("Sequence", "<Ok _skipIf=\"x &gt; 100\"/>", n), bb);
   runTicks(state, tree, n + 1);
 }
 
@@ -102,10 +101,8 @@ void BM_Tick_WithCallback(benchmark::State& state)
   tree.applyVisitor([&](BT::TreeNode* node) {
     if constexpr(H == Hook::Monitor)
     {
-      node->setTickMonitorCallback(
-          [&counter](BT::TreeNode&, BT::NodeStatus, std::chrono::microseconds) {
-            counter++;
-          });
+      node->setTickMonitorCallback([&counter](BT::TreeNode&, BT::NodeStatus,
+                                              std::chrono::microseconds) { counter++; });
     }
     else if constexpr(H == Hook::PreTick)
     {
@@ -136,8 +133,9 @@ void BM_Tick_StatusSubscribers(benchmark::State& state)
   std::vector<BT::TreeNode::StatusChangeSubscriber> subs;
   tree.applyVisitor([&](BT::TreeNode* node) {
     subs.push_back(node->subscribeToStatusChange(
-        [&counter](BT::TimePoint, const BT::TreeNode&, BT::NodeStatus,
-                   BT::NodeStatus) { counter++; }));
+        [&counter](BT::TimePoint, const BT::TreeNode&, BT::NodeStatus, BT::NodeStatus) {
+          counter++;
+        }));
   });
   runTicks(state, tree, n + 1);
   benchmark::DoNotOptimize(counter);

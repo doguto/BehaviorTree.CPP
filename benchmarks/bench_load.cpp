@@ -58,12 +58,12 @@ void BM_Load_Subtrees(benchmark::State& state)
   {
     subs += "<SubTree ID=\"Sub\"/>";
   }
-  const std::string xml =
-      "<root BTCPP_format=\"4\" main_tree_to_execute=\"MainTree\">"
-      "<BehaviorTree ID=\"MainTree\"><Sequence>" +
-      subs + "</Sequence></BehaviorTree><BehaviorTree ID=\"Sub\">" +
-      "<Sequence><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/></Sequence>"
-      "</BehaviorTree></root>";
+  const std::string xml = "<root BTCPP_format=\"4\" main_tree_to_execute=\"MainTree\">"
+                          "<BehaviorTree ID=\"MainTree\"><Sequence>" +
+                          subs + "</Sequence></BehaviorTree><BehaviorTree ID=\"Sub\">" +
+                          "<Sequence><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/><Ok/></"
+                          "Sequence>"
+                          "</BehaviorTree></root>";
   BT::BehaviorTreeFactory f;
   registerBenchNodes(f);
   for(auto _ : state)
@@ -113,8 +113,15 @@ void BM_Load_FirstTick(benchmark::State& state)
 }  // namespace
 
 BENCHMARK(BM_Factory_Construct);
-BENCHMARK(BM_Load_CreateDestroy)->Arg(10)->Arg(100)->Arg(1000)->Unit(benchmark::kMicrosecond);
-BENCHMARK(BM_Load_CreateDestroy_Ports)->Arg(100)->Arg(1000)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_Load_CreateDestroy)
+    ->Arg(10)
+    ->Arg(100)
+    ->Arg(1000)
+    ->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_Load_CreateDestroy_Ports)
+    ->Arg(100)
+    ->Arg(1000)
+    ->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_Load_Subtrees)->Arg(10)->Arg(100)->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_Load_DestroyOnly)->Arg(100)->Arg(1000)->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_Load_FirstTick)->Arg(100)->Unit(benchmark::kMicrosecond);

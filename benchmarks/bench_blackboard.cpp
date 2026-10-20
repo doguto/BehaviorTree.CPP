@@ -2,10 +2,10 @@
 #include "behaviortree_cpp/blackboard.h"
 #include "behaviortree_cpp/scripting/script_parser.hpp"
 
-#include <benchmark/benchmark.h>
-
 #include <string>
 #include <vector>
+
+#include <benchmark/benchmark.h>
 
 namespace
 {

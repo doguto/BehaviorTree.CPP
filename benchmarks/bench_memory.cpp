@@ -14,9 +14,10 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
-#include <malloc.h>
 #include <new>
 #include <vector>
+
+#include <malloc.h>
 
 namespace
 {
@@ -67,8 +68,9 @@ void* operator new(std::size_t n, const std::nothrow_t&) noexcept
 }
 void* operator new(std::size_t n, std::align_val_t a)
 {
-  return track(std::aligned_alloc(static_cast<size_t>(a), (n + static_cast<size_t>(a) - 1) &
-                                                              ~(static_cast<size_t>(a) - 1)));
+  return track(
+      std::aligned_alloc(static_cast<size_t>(a), (n + static_cast<size_t>(a) - 1) &
+                                                     ~(static_cast<size_t>(a) - 1)));
 }
 void operator delete(void* p) noexcept
 {
@@ -241,7 +243,8 @@ int main(int argc, char** argv)
   tickAllocs("Tick/Sequence_of_Ok", repeatLeaf("Sequence", "<Ok/>", 100));
   tickAllocs("Tick/ReadInt_bb", repeatLeaf("Sequence", "<ReadInt value=\"{x}\"/>", 100),
              [](BT::Blackboard& bb) { bb.set("x", 1); });
-  tickAllocs("Tick/ReadInt_literal", repeatLeaf("Sequence", "<ReadInt value=\"42\"/>", 100));
+  tickAllocs("Tick/ReadInt_literal",
+             repeatLeaf("Sequence", "<ReadInt value=\"42\"/>", 100));
   tickAllocs("Tick/ReadInt_default", repeatLeaf("Sequence", "<ReadIntDefault/>", 100));
   tickAllocs("Tick/ReadString_bb",
              repeatLeaf("Sequence", "<ReadString value=\"{s}\"/>", 100),

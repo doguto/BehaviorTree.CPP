@@ -30,7 +30,8 @@ void runPortBench(benchmark::State& state, const std::string& leaf,
 
 void BM_Port_GetInt_Blackboard(benchmark::State& state)
 {
-  runPortBench(state, "<ReadInt value=\"{x}\"/>", [](BT::Blackboard& bb) { bb.set("x", 42); });
+  runPortBench(state, "<ReadInt value=\"{x}\"/>",
+               [](BT::Blackboard& bb) { bb.set("x", 42); });
 }
 
 void BM_Port_GetInt_Literal(benchmark::State& state)
@@ -59,13 +60,15 @@ void BM_Port_GetString_Blackboard(benchmark::State& state)
 
 void BM_Port_GetString_Literal(benchmark::State& state)
 {
-  runPortBench(state, "<ReadString value=\"a literal string value, beyond any SSO buf\"/>",
+  runPortBench(state,
+               "<ReadString value=\"a literal string value, beyond any SSO buf\"/>",
                [](BT::Blackboard&) {});
 }
 
 void BM_Port_SetInt(benchmark::State& state)
 {
-  runPortBench(state, "<WriteInt value=\"{x}\"/>", [](BT::Blackboard& bb) { bb.set("x", 1); });
+  runPortBench(state, "<WriteInt value=\"{x}\"/>",
+               [](BT::Blackboard& bb) { bb.set("x", 1); });
 }
 
 // Entry lives in the parent blackboard (SubTree with remapping) -> extra lookup hops.
@@ -77,11 +80,11 @@ void BM_Port_GetInt_ThroughSubtree(benchmark::State& state)
   {
     leaves += "<ReadInt value=\"{in}\"/>";
   }
-  const std::string xml =
-      "<root BTCPP_format=\"4\" main_tree_to_execute=\"MainTree\">"
-      "<BehaviorTree ID=\"MainTree\"><SubTree ID=\"Sub\" in=\"{x}\"/></BehaviorTree>"
-      "<BehaviorTree ID=\"Sub\"><Sequence>" +
-      leaves + "</Sequence></BehaviorTree></root>";
+  const std::string xml = "<root BTCPP_format=\"4\" main_tree_to_execute=\"MainTree\">"
+                          "<BehaviorTree ID=\"MainTree\"><SubTree ID=\"Sub\" "
+                          "in=\"{x}\"/></BehaviorTree>"
+                          "<BehaviorTree ID=\"Sub\"><Sequence>" +
+                          leaves + "</Sequence></BehaviorTree></root>";
   BT::BehaviorTreeFactory f;
   auto bb = BT::Blackboard::create();
   bb->set("x", 42);

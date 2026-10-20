@@ -67,12 +67,15 @@ struct LatencyOptions
   size_t evict_mb = 32;
   int period_us = 1000;
   bool histogram = true;
+  // Tree::tickOnce() (what most applications call) instead of tickExactlyOnce()
+  bool tick_once = false;
   std::vector<Mode> modes = { Mode::Hot, Mode::Evict, Mode::Periodic, Mode::Fragmented };
 
   static constexpr const char* usage = "  --json=FILE --csv-dir=DIR --samples=N "
                                        "--rounds=N --evict-mb=N\n"
                                        "  --period-us=N --filter=SUBSTR "
-                                       "--modes=hot,evict,periodic,frag --no-hist\n";
+                                       "--modes=hot,evict,periodic,frag --no-hist "
+                                       "--tick-once\n";
 
   // Returns false if `arg` is not one of the common options.
   bool parse(const std::string& arg)
@@ -109,6 +112,8 @@ struct LatencyOptions
         }
       }
     }
+    else if(arg == "--tick-once")
+      tick_once = true;
     else if(arg == "--no-hist")
       histogram = false;
     else
@@ -435,8 +440,11 @@ private:
     TreeInstance instance = make();
     BT::Tree& tree = *instance.tree;
 
+    auto tick = [this, &tree] {
+      return opt_.tick_once ? tree.tickOnce() : tree.tickExactlyOnce();
+    };
     // first tick (tree initialization) is not part of the statistics
-    if(error = check(tree.tickExactlyOnce()); !error.empty())
+    if(error = check(tick()); !error.empty())
     {
       return {};
     }
@@ -444,7 +452,7 @@ private:
     {
       for(int i = 0; i < 200; i++)
       {
-        tree.tickExactlyOnce();
+        tick();
       }
     }
 
@@ -461,7 +469,7 @@ private:
         std::this_thread::sleep_for(std::chrono::microseconds(opt_.period_us));
       }
       const auto t1 = Clock::now();
-      const auto status = tree.tickExactlyOnce();
+      const auto status = tick();
       const auto t2 = Clock::now();
       if(error = check(status); !error.empty())
       {

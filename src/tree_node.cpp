@@ -22,25 +22,62 @@
 namespace BT
 {
 
-struct TreeNode::PImpl
+// Fields are ordered by access frequency: the first block is read or written by
+// every tick and fits in two cache lines (the struct is cache-line aligned), so
+// a tick touches as few lines as possible when the tree is not in the cache.
+struct alignas(64) TreeNode::PImpl
 {
   PImpl(std::string name, NodeConfig config)
-    : name(std::move(name)), config(std::move(config))
+    : config(std::move(config)), name(std::move(name))
   {}
 
-  const std::string name;
+  //---------- hot: used by every tick ----------
+  mutable std::mutex state_mutex;
 
   NodeStatus status = NodeStatus::IDLE;
 
-  std::condition_variable state_condition_variable;
+  // True when at least one injected callback is set. Written while holding
+  // callback_injection_mutex; lets executeTick() skip that mutex otherwise.
+  std::atomic<bool> has_injected_callbacks{ false };
 
-  mutable std::mutex state_mutex;
+  // Set when pre_parsed / post_parsed may contain scripts, i.e. once they have
+  // been handed out by preConditionsScripts() / postConditionsScripts().
+  // Otherwise executeTick() doesn't need to look at them at all.
+  bool has_condition_scripts = false;
 
   // Number of threads blocked in waitValidStatus(). Guarded by state_mutex,
   // it lets setStatus()/resetStatus() skip notify_all() when nobody waits.
   int status_waiters = 0;
 
   StatusChangeSignal state_change_signal;
+
+  std::shared_ptr<WakeUpSignal> wake_up;
+
+  //---------- used by ports, scripts and introspection ----------
+  NodeConfig config;
+
+  const std::string name;
+
+  std::string registration_ID;
+
+  std::array<ScriptFunction, size_t(PreCond::COUNT_)> pre_parsed;
+  std::array<ScriptFunction, size_t(PostCond::COUNT_)> post_parsed;
+
+  //---------- rarely used ----------
+  std::condition_variable state_condition_variable;
+
+  PreTickCallback pre_tick_callback;
+  PostTickCallback post_tick_callback;
+  TickMonitorCallback tick_monitor_callback;
+
+  std::mutex callback_injection_mutex;
+
+  void updateInjectedCallbacksFlag()
+  {
+    has_injected_callbacks.store(pre_tick_callback || post_tick_callback ||
+                                     tick_monitor_callback,
+                                 std::memory_order_release);
+  }
 
   // Called after a status change, outside state_mutex.
   // The clock is read only if there is a subscriber to receive it.
@@ -57,32 +94,6 @@ struct TreeNode::PImpl
                                  prev_status, new_status);
     }
   }
-
-  NodeConfig config;
-
-  std::string registration_ID;
-
-  PreTickCallback pre_tick_callback;
-  PostTickCallback post_tick_callback;
-  TickMonitorCallback tick_monitor_callback;
-
-  std::mutex callback_injection_mutex;
-
-  // True when at least one injected callback is set. Written while holding
-  // callback_injection_mutex; lets executeTick() skip that mutex otherwise.
-  std::atomic<bool> has_injected_callbacks{ false };
-
-  void updateInjectedCallbacksFlag()
-  {
-    has_injected_callbacks.store(pre_tick_callback || post_tick_callback ||
-                                     tick_monitor_callback,
-                                 std::memory_order_release);
-  }
-
-  std::shared_ptr<WakeUpSignal> wake_up;
-
-  std::array<ScriptFunction, size_t(PreCond::COUNT_)> pre_parsed;
-  std::array<ScriptFunction, size_t(PostCond::COUNT_)> post_parsed;
 };
 
 TreeNode::TreeNode(std::string name, NodeConfig config)
@@ -114,11 +125,21 @@ NodeStatus TreeNode::executeTick()
     monitor_tick = _p->tick_monitor_callback;
   }
 
+  const bool has_condition_scripts = _p->has_condition_scripts;
+
   // a pre-condition may return the new status.
   // In this case it override the actual tick()
-  if(auto precond = checkPreConditions())
+  std::optional<NodeStatus> precond_status;
+  if(has_condition_scripts)
   {
-    new_status = precond.value();
+    if(auto precond = checkPreConditions())
+    {
+      precond_status = precond.value();
+    }
+  }
+  if(precond_status)
+  {
+    new_status = *precond_status;
   }
   else
   {
@@ -173,7 +194,7 @@ NodeStatus TreeNode::executeTick()
   }
 
   // injected post callback
-  if(isStatusCompleted(new_status))
+  if(has_condition_scripts && isStatusCompleted(new_status))
   {
     checkPostConditions(new_status);
   }
@@ -199,6 +220,10 @@ void TreeNode::haltNode()
 {
   halt();
 
+  if(!_p->has_condition_scripts)
+  {
+    return;
+  }
   const auto& parse_executor = _p->post_parsed[size_t(PostCond::ON_HALTED)];
   if(parse_executor)
   {
@@ -232,11 +257,13 @@ void TreeNode::setStatus(NodeStatus new_status)
 
 TreeNode::PreScripts& TreeNode::preConditionsScripts()
 {
+  _p->has_condition_scripts = true;
   return _p->pre_parsed;
 }
 
 TreeNode::PostScripts& TreeNode::postConditionsScripts()
 {
+  _p->has_condition_scripts = true;
   return _p->post_parsed;
 }
 

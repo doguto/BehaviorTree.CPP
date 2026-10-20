@@ -1,9 +1,14 @@
-// Memory / allocation report. Global operator new/delete are instrumented, so
-// every C++ allocation made by the library (and by this program) is counted.
+// Memory / allocation report.
 //
 // Reports, per scenario:
 //   - bytes and allocations needed to build a tree, normalised per node
 //   - heap allocations performed by a steady-state tick (ideally 0)
+//
+// Global operator new/delete are instrumented to count C++ allocations
+// ("allocs", "alloc_bytes_total", per tick numbers). The memory held by a tree
+// ("live_bytes") is measured on the whole malloc heap instead (glibc
+// mallinfo2), so it also includes malloc overhead and memory obtained with
+// malloc/aligned_alloc directly.
 //
 // Usage: bt_membench [--json=FILE]
 #include "bench_common.h"
@@ -105,9 +110,20 @@ struct Snapshot
 {
   int64_t live, allocs, total;
 };
+
+int64_t heapInUse()
+{
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+  const auto info = mallinfo2();
+  return int64_t(info.uordblks + info.hblkhd);
+#else
+  return g_live_bytes.load();  // C++ allocations only
+#endif
+}
+
 Snapshot snap()
 {
-  return { g_live_bytes.load(), g_allocs.load(), g_total_bytes.load() };
+  return { heapInUse(), g_allocs.load(), g_total_bytes.load() };
 }
 
 struct Result

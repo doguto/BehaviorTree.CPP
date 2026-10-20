@@ -331,6 +331,30 @@ TreeNode::~TreeNode() = default;
 
 NodeStatus TreeNode::executeTick()
 {
+  // Fast path, for the nodes without injected callbacks nor condition scripts:
+  // the same as the general case below, minus what doesn't apply.
+  if(!_p->scripts && !_p->has_injected_callbacks.load(std::memory_order_acquire))
+  {
+    NodeStatus new_status;
+    try
+    {
+      new_status = tick();
+    }
+    catch(const NodeExecutionError&)
+    {
+      throw;
+    }
+    catch(const std::exception& ex)
+    {
+      throw NodeExecutionError({ name(), fullPath(), registrationName() }, ex.what());
+    }
+    if(new_status != NodeStatus::SKIPPED)
+    {
+      setStatus(new_status);
+    }
+    return new_status;
+  }
+
   auto new_status = status();
   PreTickCallback pre_tick;
   PostTickCallback post_tick;
@@ -462,6 +486,11 @@ void TreeNode::setStatus(NodeStatus new_status)
                        "If you know what you are doing (?) use resetStatus() instead.");
   }
 
+  // Common case (e.g. a node still RUNNING): nothing to write nor notify.
+  if(_p->status.load(std::memory_order_relaxed) == new_status)
+  {
+    return;
+  }
   const NodeStatus prev_status =
       _p->status.exchange(new_status, std::memory_order_seq_cst);
   if(prev_status != new_status)

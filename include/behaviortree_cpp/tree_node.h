@@ -646,6 +646,22 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
             return Timestamp{};
           }
         }
+        if constexpr(std::is_arithmetic_v<T>)
+        {
+          // A port declared with type T converts with convertFromString<T>:
+          // call it directly, without going through the converter and Any.
+          const PortInfo* info = nullptr;
+          if(config().manifest)
+          {
+            auto it = config().manifest->ports.find(key);
+            info = it != config().manifest->ports.end() ? &it->second : nullptr;
+          }
+          if(info == nullptr || !info->converter() || info->type() == typeid(T))
+          {
+            destination = parseString<T>(*port_value_str);
+            return Timestamp{};
+          }
+        }
         destination = parseStringWithConverter(*port_value_str);
       }
       catch(std::exception& ex)

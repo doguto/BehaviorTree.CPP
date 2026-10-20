@@ -608,6 +608,11 @@ void TreeNode::checkPostConditions(NodeStatus status)
 
 void TreeNode::resetStatus()
 {
+  // Common case (e.g. the children reset by their parent): already IDLE.
+  if(_p->status.load(std::memory_order_relaxed) == NodeStatus::IDLE)
+  {
+    return;
+  }
   const NodeStatus prev_status =
       _p->status.exchange(NodeStatus::IDLE, std::memory_order_seq_cst);
   if(prev_status != NodeStatus::IDLE)

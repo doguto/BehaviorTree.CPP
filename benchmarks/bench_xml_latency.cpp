@@ -8,7 +8,8 @@
 // nodes' own work (ROS, I/O, computation) is not included.
 //
 // Stubs:
-//   Action     reads all its input ports and writes back all its output ports,
+//   Action     reads all its input ports (literals as number, bool or string,
+//              guessed from the text) and writes back all its output ports,
 //              then stays RUNNING for --running-ticks ticks, then SUCCESS.
 //              Ports are touched on every tick, as a polling node would do.
 //   Condition  touches its ports, returns SUCCESS.
@@ -75,17 +76,40 @@ protected:
   void touchPorts()
   {
     const auto& config = this->config();
-    for(const auto& [name, value] : config.input_ports)
+    if(!inputs_initialized_)
     {
-      if(BT::TreeNode::isBlackboardPointer(value) || value == "{=}" || value == "=")
+      // The real node would read a literal with its own type: guess it from
+      // the text, once (the cost of guessing is not part of the measure).
+      for(const auto& [name, value] : config.input_ports)
       {
-        BT::Any any;
-        (void)this->getInput(name, any);
+        inputs_.emplace_back(name, kindOf(value));
       }
-      else
+      inputs_initialized_ = true;
+    }
+    for(const auto& [name, kind] : inputs_)
+    {
+      switch(kind)
       {
-        std::string str;
-        (void)this->getInput(name, str);
+        case Kind::Blackboard: {
+          BT::Any any;
+          (void)this->getInput(name, any);
+          break;
+        }
+        case Kind::Number: {
+          double number = 0;
+          (void)this->getInput(name, number);
+          break;
+        }
+        case Kind::Bool: {
+          bool flag = false;
+          (void)this->getInput(name, flag);
+          break;
+        }
+        case Kind::String: {
+          std::string str;
+          (void)this->getInput(name, str);
+          break;
+        }
       }
     }
     for(const auto& [name, value] : config.output_ports)
@@ -115,6 +139,37 @@ protected:
       }
     }
   }
+
+private:
+  enum class Kind
+  {
+    Blackboard,
+    Number,
+    Bool,
+    String
+  };
+
+  static Kind kindOf(const std::string& value)
+  {
+    if(BT::TreeNode::isBlackboardPointer(value) || value == "{=}" || value == "=")
+    {
+      return Kind::Blackboard;
+    }
+    if(value == "true" || value == "false")
+    {
+      return Kind::Bool;
+    }
+    char* end = nullptr;
+    (void)std::strtod(value.c_str(), &end);
+    if(!value.empty() && *end == '\0')
+    {
+      return Kind::Number;
+    }
+    return Kind::String;
+  }
+
+  std::vector<std::pair<std::string, Kind>> inputs_;
+  bool inputs_initialized_ = false;
 };
 
 class StubAction : public PortToucher<BT::StatefulActionNode>

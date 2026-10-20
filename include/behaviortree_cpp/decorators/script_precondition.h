@@ -87,9 +87,12 @@ private:
     }
 
     // Only check the 'if' script if we haven't started ticking the children yet.
-    Ast::Environment env = { config().blackboard, config().enums };
-    bool tick_children =
-        _children_running || (_children_running = _executor(env).cast<bool>());
+    bool tick_children = _children_running;
+    if(!tick_children)
+    {
+      Ast::Environment env = { config().blackboard, config().enums };
+      tick_children = _children_running = _executor(env).cast<bool>();
+    }
 
     if(!tick_children)
     {

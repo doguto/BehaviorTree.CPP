@@ -21,6 +21,8 @@
 #include <cstring>
 #include <new>
 #include <optional>
+#include <typeindex>
+#include <typeinfo>
 #include <vector>
 
 namespace BT
@@ -135,6 +137,36 @@ private:
   }
 };
 
+// Standard allocator using NodeDataArena, for containers owned by the node data.
+template <typename T>
+struct ArenaAllocator
+{
+  using value_type = T;
+  ArenaAllocator() = default;
+  template <typename U>
+  ArenaAllocator(const ArenaAllocator<U>&) noexcept
+  {}
+  T* allocate(std::size_t n)
+  {
+    static_assert(alignof(T) <= NodeDataArena::kAlign);
+    return static_cast<T*>(NodeDataArena::allocate(n * sizeof(T)));
+  }
+  void deallocate(T* ptr, std::size_t n) noexcept
+  {
+    NodeDataArena::deallocate(ptr, n * sizeof(T));
+  }
+  template <typename U>
+  bool operator==(const ArenaAllocator<U>&) const noexcept
+  {
+    return true;
+  }
+  template <typename U>
+  bool operator!=(const ArenaAllocator<U>&) const noexcept
+  {
+    return false;
+  }
+};
+
 // Base class: allocate the derived type with NodeDataArena.
 // The derived type must be final, so that delete gets the allocated size.
 struct ArenaAllocated
@@ -205,6 +237,77 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
   const std::string name;
 
   std::string registration_ID;
+
+  // Cache of the input ports read by getInput(), see getPortEntry() and
+  // getCachedLiteral(). One item per port, created by its first read.
+  struct PortCache
+  {
+    // identifies the port: address of its value in config.input_ports
+    const std::string* port_value = nullptr;
+    // copy of the value of the port when the item was filled. The item is
+    // valid only while the port still has this value.
+    std::string port_text;
+    // blackboard entry (may be null if the key was not found)
+    const Blackboard* blackboard = nullptr;
+    uint64_t structure_version = 0;
+    std::shared_ptr<Blackboard::Entry> entry;
+    bool has_entry = false;
+    // value converted from a literal port (only for built-in types)
+    const std::type_info* literal_type = nullptr;
+    Any literal;
+  };
+  std::vector<PortCache, ArenaAllocator<PortCache>> port_cache;
+  // Taken while using port_cache. If a thread finds it taken (the same node
+  // read from two threads at once) it doesn't wait: it skips the cache.
+  mutable std::atomic_flag port_cache_busy = ATOMIC_FLAG_INIT;
+
+  // Holds port_cache_busy, if it was free
+  class PortCacheGuard
+  {
+  public:
+    explicit PortCacheGuard(const PImpl& p)
+      : flag_(p.port_cache_busy), owned_(!flag_.test_and_set(std::memory_order_acquire))
+    {}
+    ~PortCacheGuard()
+    {
+      if(owned_)
+      {
+        flag_.clear(std::memory_order_release);
+      }
+    }
+    PortCacheGuard(const PortCacheGuard&) = delete;
+    PortCacheGuard& operator=(const PortCacheGuard&) = delete;
+    [[nodiscard]] bool owned() const
+    {
+      return owned_;
+    }
+
+  private:
+    std::atomic_flag& flag_;
+    bool owned_;
+  };
+
+  // Item of `port_value`, emptied if the value of the port changed.
+  // Call while holding port_cache_busy.
+  PortCache& portCache(const std::string& port_value)
+  {
+    auto it = std::find_if(port_cache.begin(), port_cache.end(), [&](const PortCache& c) {
+      return c.port_value == &port_value;
+    });
+    if(it == port_cache.end())
+    {
+      it = port_cache.insert(port_cache.end(), PortCache{});
+      it->port_value = &port_value;
+      it->port_text = port_value;
+    }
+    else if(it->port_text != port_value)
+    {
+      *it = PortCache{};
+      it->port_value = &port_value;
+      it->port_text = port_value;
+    }
+    return *it;
+  }
 
   //---------- rarely used: allocated on first use ----------
 
@@ -724,6 +827,85 @@ void TreeNode::setRegistrationID(StringView ID)
 void TreeNode::setWakeUpInstance(std::shared_ptr<WakeUpSignal> instance)
 {
   _p->wake_up = instance;
+}
+
+std::shared_ptr<Blackboard::Entry> TreeNode::getPortEntry(const std::string& port_value,
+                                                          StringView key) const
+{
+  const auto& blackboard = _p->config.blackboard;
+  const PImpl::PortCacheGuard guard(*_p);
+  if(!guard.owned())
+  {
+    return blackboard->getEntry(std::string(key));
+  }
+  // Read the version before the lookup: a change made during the lookup
+  // invalidates the result at the next call.
+  const uint64_t version = Blackboard::structureVersion();
+
+  auto& cache = _p->portCache(port_value);
+  if(cache.has_entry && cache.structure_version == version &&
+     cache.blackboard == blackboard.get())
+  {
+    return cache.entry;
+  }
+  // the key depends only on the value of the port, checked by portCache()
+  cache.entry = blackboard->getEntry(std::string(key));
+  cache.blackboard = blackboard.get();
+  cache.structure_version = version;
+  cache.has_entry = true;
+  return cache.entry;
+}
+
+bool TreeNode::getCachedLiteral(const std::string& port_value, const std::type_info& type,
+                                Any& value) const
+{
+  const PImpl::PortCacheGuard guard(*_p);
+  if(!guard.owned())
+  {
+    return false;
+  }
+  const auto& cache = _p->portCache(port_value);
+  if(cache.literal_type == nullptr || *cache.literal_type != type)
+  {
+    return false;
+  }
+  value = cache.literal;
+  return true;
+}
+
+bool TreeNode::literalUsesBuiltinConversion(const std::string& key) const
+{
+  const auto* manifest = _p->config.manifest;
+  if(manifest == nullptr)
+  {
+    return true;
+  }
+  auto it = manifest->ports.find(key);
+  if(it == manifest->ports.end() || !it->second.converter())
+  {
+    return true;
+  }
+  static const std::array<std::type_index, 14> builtin = {
+    typeid(bool),          typeid(char),         typeid(signed char),
+    typeid(unsigned char), typeid(short),        typeid(unsigned short),
+    typeid(int),           typeid(unsigned int), typeid(long),
+    typeid(unsigned long), typeid(long long),    typeid(unsigned long long),
+    typeid(float),         typeid(double)
+  };
+  const std::type_index type = it->second.type();
+  return std::find(builtin.begin(), builtin.end(), type) != builtin.end();
+}
+
+void TreeNode::cacheLiteral(const std::string& port_value, const std::type_info& type,
+                            Any value) const
+{
+  const PImpl::PortCacheGuard guard(*_p);
+  if(guard.owned())
+  {
+    auto& cache = _p->portCache(port_value);
+    cache.literal_type = &type;
+    cache.literal = std::move(value);
+  }
 }
 
 void TreeNode::modifyPortsRemapping(const PortsRemapping& new_remapping)

@@ -7,6 +7,7 @@
 #include "behaviortree_cpp/utils/polymorphic_cast_registry.hpp"
 #include "behaviortree_cpp/utils/safe_any.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -76,7 +77,7 @@ public:
     return std::shared_ptr<Blackboard>(new Blackboard(parent));
   }
 
-  virtual ~Blackboard() = default;
+  virtual ~Blackboard();
 
   void enableAutoRemapping(bool remapping);
 
@@ -184,6 +185,14 @@ private:
 
   std::shared_ptr<Entry> createEntryImpl(const std::string& key, const TypeInfo& info);
 
+  // Structure version: incremented, for all the blackboards, whenever an entry
+  // is added or removed, a remapping changes or a blackboard is destroyed, i.e.
+  // whenever getEntry(key) could return something else than before.
+  // TreeNode uses it to cache the entries of its ports.
+  friend class TreeNode;
+  static void notifyStructureChange();
+  [[nodiscard]] static uint64_t structureVersion();
+
   bool autoremapping_ = false;
 
   // Optional registry for polymorphic shared_ptr conversions
@@ -266,6 +275,7 @@ inline void Blackboard::unset(const std::string& key)
   }
 
   storage_.erase(it);
+  notifyStructureChange();
 }
 
 template <typename T>

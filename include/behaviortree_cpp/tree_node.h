@@ -443,6 +443,22 @@ private:
   Expected<NodeStatus> checkPreConditions();
   void checkPostConditions(NodeStatus status);
 
+  // Same as config().blackboard->getEntry(key), but remembers the result for
+  // the input port whose value (in config().input_ports) is `port_value`.
+  [[nodiscard]] std::shared_ptr<Blackboard::Entry>
+  getPortEntry(const std::string& port_value, StringView key) const;
+
+  // Value of the literal input port `port_value` converted to `type`, if it was
+  // stored by cacheLiteral() since the port has its current value.
+  [[nodiscard]] bool getCachedLiteral(const std::string& port_value,
+                                      const std::type_info& type, Any& value) const;
+  void cacheLiteral(const std::string& port_value, const std::type_info& type,
+                    Any value) const;
+  // True if a literal of input port `key` is converted by the library itself
+  // (no converter, or a port declared with a built-in arithmetic type), i.e.
+  // deterministically: then the result of the conversion can be cached.
+  [[nodiscard]] bool literalUsesBuiltinConversion(const std::string& key) const;
+
   /// The method used to interrupt the execution of a RUNNING node.
   /// Only Async nodes that may return RUNNING should implement it.
   virtual void halt() = 0;
@@ -592,6 +608,26 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     {
       try
       {
+        // Built-in types are converted by the library, always to the same
+        // value: remember the result for the ports declared in the XML.
+        if constexpr(std::is_arithmetic_v<T>)
+        {
+          if(port_value_str != &default_value_str)
+          {
+            Any cached;
+            if(getCachedLiteral(*port_value_str, typeid(T), cached))
+            {
+              destination = cached.cast<T>();
+              return Timestamp{};
+            }
+            destination = parseStringWithConverter(*port_value_str);
+            if(literalUsesBuiltinConversion(key))
+            {
+              cacheLiteral(*port_value_str, typeid(T), Any(destination));
+            }
+            return Timestamp{};
+          }
+        }
         destination = parseStringWithConverter(*port_value_str);
       }
       catch(std::exception& ex)
@@ -608,7 +644,11 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
                                      "an invalid Blackboard");
     }
 
-    if(auto entry = config().blackboard->getEntry(std::string(blackboard_key)))
+    // the entry of a port declared in the XML is cached, see getPortEntry()
+    auto entry = port_value_str == &default_value_str ?
+                     config().blackboard->getEntry(std::string(blackboard_key)) :
+                     getPortEntry(*port_value_str, blackboard_key);
+    if(entry)
     {
       std::unique_lock lk(entry->entry_mutex);
       auto& any_value = entry->value;

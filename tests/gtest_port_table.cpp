@@ -3,6 +3,7 @@
 // parsed at every call.
 #include "behaviortree_cpp/bt_factory.h"
 
+#include <atomic>
 #include <future>
 #include <thread>
 #include <vector>
@@ -199,4 +200,171 @@ TEST(PortTable, ConcurrentFirstRead)
       EXPECT_TRUE(r.get());
     }
   }
+}
+
+namespace
+{
+// Reads "in" into *out, writes "out" from *to_write, at every tick
+class Copier : public SyncActionNode
+{
+public:
+  Copier(const std::string& name, const NodeConfig& config, int* out, int* to_write)
+    : SyncActionNode(name, config), out_(out), to_write_(to_write)
+  {}
+  static PortsList providedPorts()
+  {
+    return { InputPort<int>("in"), OutputPort<int>("out") };
+  }
+  NodeStatus tick() override
+  {
+    *out_ = getInput<int>("in").value();
+    if(auto res = setOutput("out", *to_write_); !res)
+    {
+      throw RuntimeError(res.error());
+    }
+    return NodeStatus::SUCCESS;
+  }
+
+private:
+  int* out_;
+  int* to_write_;
+};
+}  // namespace
+
+TEST(PortTable, BoundEntriesFollowTheBlackboards)
+{
+  BehaviorTreeFactory factory;
+  int read = 0;
+  int to_write = 1;
+  factory.registerNodeType<Copier>("Copier", &read, &to_write);
+  auto root_bb = Blackboard::create();
+  root_bb->set("x", 10);
+  auto tree = factory.createTreeFromText(R"(
+<root BTCPP_format="4" main_tree_to_execute="Main">
+  <BehaviorTree ID="Main">
+    <SubTree ID="Sub" _autoremap="true"/>
+  </BehaviorTree>
+  <BehaviorTree ID="Sub">
+    <Copier in="{x}" out="{y}"/>
+  </BehaviorTree>
+</root>)",
+                                         root_bb);
+  auto sub_bb = tree.subtrees.at(1)->blackboard;
+
+  ASSERT_EQ(tree.tickExactlyOnce(), NodeStatus::SUCCESS);
+  EXPECT_EQ(read, 10);
+  EXPECT_EQ(root_bb->get<int>("y"), 1);  // created in the root (autoremap)
+
+  // values change, entries don't
+  root_bb->set("x", 11);
+  to_write = 2;
+  ASSERT_EQ(tree.tickExactlyOnce(), NodeStatus::SUCCESS);
+  EXPECT_EQ(read, 11);
+  EXPECT_EQ(root_bb->get<int>("y"), 2);
+
+  // removed and created again: the new entries are used
+  root_bb->unset("x");
+  root_bb->unset("y");
+  root_bb->set("x", 12);
+  to_write = 3;
+  ASSERT_EQ(tree.tickExactlyOnce(), NodeStatus::SUCCESS);
+  EXPECT_EQ(read, 12);
+  EXPECT_EQ(root_bb->get<int>("y"), 3);
+
+  // a private entry of the subtree hides the one of the root... ("_" keys are
+  // never remapped: use a manual remapping instead)
+  sub_bb->addSubtreeRemapping("x", "z");
+  root_bb->set("z", 42);
+  ASSERT_EQ(tree.tickExactlyOnce(), NodeStatus::SUCCESS);
+  EXPECT_EQ(read, 42);
+
+  // ...and the missing entry is reported
+  root_bb->unset("z");
+  EXPECT_ANY_THROW((void)tree.tickExactlyOnce());
+}
+
+TEST(PortTable, BoundOutputKeepsTheTypeChecks)
+{
+  BehaviorTreeFactory factory;
+  int read = 0;
+  int to_write = 7;
+  factory.registerNodeType<Copier>("Copier", &read, &to_write);
+  auto bb = Blackboard::create();
+  bb->set("x", 1);
+  auto tree = factory.createTreeFromText(R"(
+<root BTCPP_format="4"><BehaviorTree ID="Main">
+  <Copier in="{x}" out="{y}"/>
+</BehaviorTree></root>)",
+                                         bb);
+  ASSERT_EQ(tree.tickExactlyOnce(), NodeStatus::SUCCESS);
+  EXPECT_EQ(bb->get<int>("y"), 7);
+  // the entry now holds another type: writing an int is refused, as before
+  bb->unset("y");
+  bb->set("y", std::string("text"));
+  bb->unset("y");
+  bb->set("y", std::vector<int>{ 1 });
+  EXPECT_ANY_THROW((void)tree.tickExactlyOnce());
+}
+
+TEST(PortTable, ScriptVariablesFollowTheBlackboard)
+{
+  BehaviorTreeFactory factory;
+  auto bb = Blackboard::create();
+  bb->set("x", 1);
+  auto tree = factory.createTreeFromText(R"(
+<root BTCPP_format="4"><BehaviorTree ID="Main">
+  <ScriptCondition code="x == 1"/>
+</BehaviorTree></root>)",
+                                         bb);
+  EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::SUCCESS);
+  bb->set("x", 2);
+  EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::FAILURE);
+  bb->unset("x");
+  EXPECT_ANY_THROW((void)tree.tickExactlyOnce());
+  bb->set("x", 1);
+  EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::SUCCESS);
+}
+
+TEST(PortTable, ConcurrentReadsAndStructureChanges)
+{
+  NodeConfig config;
+  config.input_ports["in"] = "{x}";
+  config.output_ports["out"] = "{y}";
+  config.blackboard = Blackboard::create();
+  config.blackboard->set("x", 5);
+  int read = 0;
+  int to_write = 1;
+  Copier node("copier", config, &read, &to_write);
+
+  std::atomic_bool stop = false;
+  // another thread changes the structure of the blackboard meanwhile
+  auto changer = std::async(std::launch::async, [&] {
+    int i = 0;
+    while(!stop)
+    {
+      config.blackboard->set("other_" + std::to_string(i++ % 50), i);
+      config.blackboard->unset("other_" + std::to_string((i + 25) % 50));
+    }
+  });
+  std::vector<std::future<bool>> readers;
+  for(int t = 0; t < 3; t++)
+  {
+    readers.push_back(std::async(std::launch::async, [&node] {
+      for(int i = 0; i < 2000; i++)
+      {
+        int value = 0;
+        if(!node.getInput("in", value) || value != 5)
+        {
+          return false;
+        }
+      }
+      return true;
+    }));
+  }
+  for(auto& r : readers)
+  {
+    EXPECT_TRUE(r.get());
+  }
+  stop = true;
+  changer.get();
 }

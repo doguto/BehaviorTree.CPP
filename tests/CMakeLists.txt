@@ -46,6 +46,7 @@ set(BT_TESTS
   gtest_subtree.cpp
   gtest_switch.cpp
   gtest_get_input.cpp
+  gtest_script_reload.cpp
   gtest_tick_hooks.cpp
   gtest_tree.cpp
   gtest_try_catch.cpp

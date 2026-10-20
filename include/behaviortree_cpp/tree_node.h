@@ -23,6 +23,7 @@
 #include <charconv>
 #include <exception>
 #include <map>
+#include <new>
 #include <optional>
 #include <utility>
 
@@ -175,6 +176,24 @@ public:
   TreeNode& operator=(TreeNode&& other) noexcept;
 
   virtual ~TreeNode();
+
+  // Nodes (including derived classes) are allocated next to each other and to
+  // their internal data, in creation order, to be cache friendly when ticked.
+  // A node allocated with these must be deleted through them: use `new`/`delete`
+  // or std::unique_ptr, as usual.
+  static void* operator new(std::size_t size);
+  static void* operator new(std::size_t size, std::align_val_t align);
+  static void operator delete(void* ptr, std::size_t size) noexcept;
+  static void operator delete(void* ptr, std::size_t size,
+                              std::align_val_t align) noexcept;
+  // the other usual forms
+  static void* operator new(std::size_t size, const std::nothrow_t&) noexcept;
+  static void* operator new(std::size_t, void* where) noexcept
+  {
+    return where;
+  }
+  static void operator delete(void*, void*) noexcept
+  {}
 
   /// The method that should be used to invoke tick() and setStatus();
   virtual BT::NodeStatus executeTick();
@@ -452,6 +471,25 @@ private:
 
 namespace details
 {
+// True if the input port `key` is set (in the XML) to a literal equal to `value`,
+// i.e. getInput<std::string>(key) would return `value`. Nodes use it to check
+// that a script didn't change without copying it at every tick.
+inline bool literalPortEquals(const NodeConfig& config, const std::string& key,
+                              const std::string& value)
+{
+  auto it = config.input_ports.find(key);
+  if(it == config.input_ports.end())
+  {
+    return false;
+  }
+  const std::string& raw = it->second;
+  if(raw == "=" || TreeNode::isBlackboardPointer(raw))
+  {
+    return false;
+  }
+  return raw == value;
+}
+
 // Pointer to the value stored in `any` if its internal type is exactly T, or nullptr.
 // Any::castPtr<float> is not allowed (floats are stored as double).
 template <typename T>
@@ -592,6 +630,22 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     {
       try
       {
+        if constexpr(std::is_same_v<T, std::string>)
+        {
+          // The literal of a string port converts to itself: copy it directly,
+          // reusing the buffer of destination.
+          const PortInfo* info = nullptr;
+          if(config().manifest)
+          {
+            auto it = config().manifest->ports.find(key);
+            info = it != config().manifest->ports.end() ? &it->second : nullptr;
+          }
+          if(info == nullptr || !info->converter() || info->type() == typeid(std::string))
+          {
+            destination = *port_value_str;
+            return Timestamp{};
+          }
+        }
         destination = parseStringWithConverter(*port_value_str);
       }
       catch(std::exception& ex)

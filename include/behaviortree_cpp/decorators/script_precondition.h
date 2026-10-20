@@ -65,9 +65,25 @@ private:
     loadExecutor();
 
     BT::NodeStatus else_return = NodeStatus::FAILURE;
-    if(!getInput("else", else_return))
+    if(_else_cached && details::literalPortEquals(config(), "else", _else_text))
     {
-      throw RuntimeError("Missing parameter [else] in Precondition");
+      // a literal, converted already (NodeStatus conversion is deterministic)
+      else_return = _else_value;
+    }
+    else
+    {
+      if(!getInput("else", else_return))
+      {
+        throw RuntimeError("Missing parameter [else] in Precondition");
+      }
+      auto it = config().input_ports.find("else");
+      _else_cached = it != config().input_ports.end() && it->second != "=" &&
+                     !isBlackboardPointer(it->second);
+      if(_else_cached)
+      {
+        _else_text = it->second;
+        _else_value = else_return;
+      }
     }
 
     // Only check the 'if' script if we haven't started ticking the children yet.
@@ -91,6 +107,11 @@ private:
 
   void loadExecutor()
   {
+    // usual case: a literal script, already parsed
+    if(_executor && details::literalPortEquals(config(), "if", _script))
+    {
+      return;
+    }
     std::string script;
     if(!getInput("if", script))
     {
@@ -115,6 +136,10 @@ private:
   std::string _script;
   ScriptFunction _executor;
   bool _children_running = false;
+  // last literal value of the port "else", and its conversion
+  std::string _else_text;
+  NodeStatus _else_value = NodeStatus::FAILURE;
+  bool _else_cached = false;
 };
 
 }  // namespace BT

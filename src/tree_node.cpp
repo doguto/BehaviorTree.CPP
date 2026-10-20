@@ -278,6 +278,42 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
   }
 };
 
+void* TreeNode::operator new(std::size_t size)
+{
+  return NodeDataArena::allocate(size);
+}
+
+void* TreeNode::operator new(std::size_t size, std::align_val_t align)
+{
+  if(static_cast<size_t>(align) > NodeDataArena::kAlign)
+  {
+    throw std::bad_alloc();
+  }
+  return NodeDataArena::allocate(size);
+}
+
+void* TreeNode::operator new(std::size_t size, const std::nothrow_t&) noexcept
+{
+  try
+  {
+    return NodeDataArena::allocate(size);
+  }
+  catch(...)
+  {
+    return nullptr;
+  }
+}
+
+void TreeNode::operator delete(void* ptr, std::size_t size) noexcept
+{
+  NodeDataArena::deallocate(ptr, size);
+}
+
+void TreeNode::operator delete(void* ptr, std::size_t size, std::align_val_t) noexcept
+{
+  NodeDataArena::deallocate(ptr, size);
+}
+
 TreeNode::TreeNode(std::string name, NodeConfig config)
   : _p(new PImpl(std::move(name), std::move(config)))
 {}

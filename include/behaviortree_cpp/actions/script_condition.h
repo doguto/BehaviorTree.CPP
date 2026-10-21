@@ -50,6 +50,11 @@ private:
 
   void loadExecutor()
   {
+    // usual case: a literal script, already parsed
+    if(_executor && details::literalPortEquals(config(), "code", _script))
+    {
+      return;
+    }
     std::string script;
     if(!getInput("code", script))
     {

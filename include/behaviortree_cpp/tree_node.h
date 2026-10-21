@@ -479,6 +479,21 @@ private:
 
 namespace details
 {
+// True if the input port `key` is set (in the XML) to a literal equal to `value`,
+// i.e. getInput<std::string>(key) would return `value`. Nodes use it to check
+// that a script didn't change without copying it at every tick.
+inline bool literalPortEquals(const NodeConfig& config, const std::string& key,
+                              const std::string& value)
+{
+  auto it = config.input_ports.find(key);
+  if(it == config.input_ports.end())
+  {
+    return false;
+  }
+  const std::string& raw = it->second;
+  return !TreeNode::blackboardKeyOf(key, raw) && raw == value;
+}
+
 // Pointer to the value stored in `any` if its internal type is exactly T, or nullptr.
 // Any::castPtr<float> is not allowed (floats are stored as double).
 template <typename T>
@@ -606,6 +621,38 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     {
       try
       {
+        if constexpr(std::is_same_v<T, std::string>)
+        {
+          // The literal of a string port converts to itself: copy it directly,
+          // reusing the buffer of destination.
+          const PortInfo* info = nullptr;
+          if(config().manifest)
+          {
+            auto it = config().manifest->ports.find(key);
+            info = it != config().manifest->ports.end() ? &it->second : nullptr;
+          }
+          if(info == nullptr || !info->converter() || info->type() == typeid(std::string))
+          {
+            destination = *port_value_str;
+            return Timestamp{};
+          }
+        }
+        if constexpr(std::is_arithmetic_v<T>)
+        {
+          // A port declared with type T converts with convertFromString<T>:
+          // call it directly, without going through the converter and Any.
+          const PortInfo* info = nullptr;
+          if(config().manifest)
+          {
+            auto it = config().manifest->ports.find(key);
+            info = it != config().manifest->ports.end() ? &it->second : nullptr;
+          }
+          if(info == nullptr || !info->converter() || info->type() == typeid(T))
+          {
+            destination = parseString<T>(*port_value_str);
+            return Timestamp{};
+          }
+        }
         destination = parseStringWithConverter(*port_value_str);
       }
       catch(std::exception& ex)

@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 namespace BT
@@ -35,7 +36,27 @@ struct TreeNode::PImpl
 
   mutable std::mutex state_mutex;
 
+  // Number of threads blocked in waitValidStatus(). Guarded by state_mutex,
+  // it lets setStatus()/resetStatus() skip notify_all() when nobody waits.
+  int status_waiters = 0;
+
   StatusChangeSignal state_change_signal;
+
+  // Called after a status change, outside state_mutex.
+  // The clock is read only if there is a subscriber to receive it.
+  void notifyStatusChange(TreeNode& node, NodeStatus prev_status, NodeStatus new_status,
+                          bool has_waiters)
+  {
+    if(has_waiters)
+    {
+      state_condition_variable.notify_all();
+    }
+    if(!state_change_signal.empty())
+    {
+      state_change_signal.notify(std::chrono::high_resolution_clock::now(), node,
+                                 prev_status, new_status);
+    }
+  }
 
   NodeConfig config;
 
@@ -46,6 +67,17 @@ struct TreeNode::PImpl
   TickMonitorCallback tick_monitor_callback;
 
   std::mutex callback_injection_mutex;
+
+  // True when at least one injected callback is set. Written while holding
+  // callback_injection_mutex; lets executeTick() skip that mutex otherwise.
+  std::atomic<bool> has_injected_callbacks{ false };
+
+  void updateInjectedCallbacksFlag()
+  {
+    has_injected_callbacks.store(pre_tick_callback || post_tick_callback ||
+                                     tick_monitor_callback,
+                                 std::memory_order_release);
+  }
 
   std::shared_ptr<WakeUpSignal> wake_up;
 
@@ -74,6 +106,7 @@ NodeStatus TreeNode::executeTick()
   PreTickCallback pre_tick;
   PostTickCallback post_tick;
   TickMonitorCallback monitor_tick;
+  if(_p->has_injected_callbacks.load(std::memory_order_acquire))
   {
     const std::scoped_lock lk(_p->callback_injection_mutex);
     pre_tick = _p->pre_tick_callback;
@@ -106,10 +139,16 @@ NodeStatus TreeNode::executeTick()
     if(!substituted)
     {
       using namespace std::chrono;
-      // Use atomic_thread_fence to prevent compiler reordering of time measurements.
-      // See issue #861 for details.
-      const auto t1 = steady_clock::now();
-      std::atomic_thread_fence(std::memory_order_seq_cst);
+      // The duration is only needed by the tick monitor: don't read the clock otherwise.
+      const bool timed = static_cast<bool>(monitor_tick);
+      steady_clock::time_point t1;
+      if(timed)
+      {
+        // Use atomic_thread_fence to prevent compiler reordering of time measurements.
+        // See issue #861 for details.
+        t1 = steady_clock::now();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+      }
       try
       {
         new_status = tick();
@@ -124,10 +163,10 @@ NodeStatus TreeNode::executeTick()
         // Wrap the exception with this node's context
         throw NodeExecutionError({ name(), fullPath(), registrationName() }, ex.what());
       }
-      std::atomic_thread_fence(std::memory_order_seq_cst);
-      const auto t2 = steady_clock::now();
-      if(monitor_tick)
+      if(timed)
       {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const auto t2 = steady_clock::now();
         monitor_tick(*this, new_status, duration_cast<microseconds>(t2 - t1));
       }
     }
@@ -178,16 +217,16 @@ void TreeNode::setStatus(NodeStatus new_status)
   }
 
   NodeStatus prev_status = NodeStatus::IDLE;
+  bool has_waiters = false;
   {
     const std::unique_lock<std::mutex> UniqueLock(_p->state_mutex);
     prev_status = _p->status;
     _p->status = new_status;
+    has_waiters = _p->status_waiters > 0;
   }
   if(prev_status != new_status)
   {
-    _p->state_condition_variable.notify_all();
-    _p->state_change_signal.notify(std::chrono::high_resolution_clock::now(), *this,
-                                   prev_status, new_status);
+    _p->notifyStatusChange(*this, prev_status, new_status, has_waiters);
   }
 }
 
@@ -203,7 +242,15 @@ TreeNode::PostScripts& TreeNode::postConditionsScripts()
 
 Expected<NodeStatus> TreeNode::checkPreConditions()
 {
-  Ast::Environment env = { config().blackboard, config().enums };
+  // Built only when a script exists: copying its shared_ptrs is not free.
+  std::optional<Ast::Environment> env_storage;
+  auto env = [&]() -> Ast::Environment& {
+    if(!env_storage)
+    {
+      env_storage.emplace(Ast::Environment{ config().blackboard, config().enums });
+    }
+    return *env_storage;
+  };
 
   // Check pre-conditions in order: FAILURE_IF, SUCCESS_IF, SKIP_IF, WHILE_TRUE.
   // IMPORTANT: _failureIf, _successIf, and _skipIf are evaluated ONLY when the
@@ -223,7 +270,7 @@ Expected<NodeStatus> TreeNode::checkPreConditions()
     if(_p->status == NodeStatus::IDLE || _p->status == NodeStatus::SKIPPED)
     {
       // what to do if the condition is true
-      if(parse_executor(env).cast<bool>())
+      if(parse_executor(env()).cast<bool>())
       {
         if(preID == PreCond::FAILURE_IF)
         {
@@ -248,7 +295,7 @@ Expected<NodeStatus> TreeNode::checkPreConditions()
     {
       // _while is the ONLY precondition checked while RUNNING.
       // If the condition becomes false, halt the node and return SKIPPED.
-      if(!parse_executor(env).cast<bool>())
+      if(!parse_executor(env()).cast<bool>())
       {
         haltNode();
         return NodeStatus::SKIPPED;
@@ -283,17 +330,17 @@ void TreeNode::checkPostConditions(NodeStatus status)
 void TreeNode::resetStatus()
 {
   NodeStatus prev_status = NodeStatus::IDLE;
+  bool has_waiters = false;
   {
     const std::unique_lock<std::mutex> lock(_p->state_mutex);
     prev_status = _p->status;
     _p->status = NodeStatus::IDLE;
+    has_waiters = _p->status_waiters > 0;
   }
 
   if(prev_status != NodeStatus::IDLE)
   {
-    _p->state_condition_variable.notify_all();
-    _p->state_change_signal.notify(std::chrono::high_resolution_clock::now(), *this,
-                                   prev_status, NodeStatus::IDLE);
+    _p->notifyStatusChange(*this, prev_status, NodeStatus::IDLE, has_waiters);
   }
 }
 
@@ -307,10 +354,12 @@ NodeStatus TreeNode::waitValidStatus()
 {
   std::unique_lock<std::mutex> lock(_p->state_mutex);
 
+  _p->status_waiters++;
   while(isHalted())
   {
     _p->state_condition_variable.wait(lock);
   }
+  _p->status_waiters--;
   return _p->status;
 }
 
@@ -334,18 +383,21 @@ void TreeNode::setPreTickFunction(PreTickCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
   _p->pre_tick_callback = std::move(callback);
+  _p->updateInjectedCallbacksFlag();
 }
 
 void TreeNode::setPostTickFunction(PostTickCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
   _p->post_tick_callback = std::move(callback);
+  _p->updateInjectedCallbacksFlag();
 }
 
 void TreeNode::setTickMonitorCallback(TickMonitorCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
   _p->tick_monitor_callback = std::move(callback);
+  _p->updateInjectedCallbacksFlag();
 }
 
 uint16_t TreeNode::UID() const

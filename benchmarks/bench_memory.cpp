@@ -1,0 +1,311 @@
+// Memory / allocation report.
+//
+// Reports, per scenario:
+//   - bytes and allocations needed to build a tree, normalised per node
+//   - heap allocations performed by a steady-state tick (ideally 0)
+//
+// Global operator new/delete are instrumented to count C++ allocations
+// ("allocs", "alloc_bytes_total", per tick numbers). The memory held by a tree
+// ("live_bytes") is measured on the whole malloc heap instead (glibc
+// mallinfo2), so it also includes malloc overhead and memory obtained with
+// malloc/aligned_alloc directly.
+//
+// Usage: bt_membench [--json=FILE]
+#include "bench_common.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <new>
+#include <vector>
+
+#include <malloc.h>
+
+namespace
+{
+std::atomic<int64_t> g_live_bytes{ 0 };
+std::atomic<int64_t> g_allocs{ 0 };
+std::atomic<int64_t> g_total_bytes{ 0 };
+
+inline void* track(void* p)
+{
+  if(p == nullptr)
+  {
+    throw std::bad_alloc();
+  }
+  const auto sz = static_cast<int64_t>(malloc_usable_size(p));
+  g_live_bytes.fetch_add(sz, std::memory_order_relaxed);
+  g_total_bytes.fetch_add(sz, std::memory_order_relaxed);
+  g_allocs.fetch_add(1, std::memory_order_relaxed);
+  return p;
+}
+
+inline void untrack(void* p) noexcept
+{
+  if(p != nullptr)
+  {
+    g_live_bytes.fetch_sub(static_cast<int64_t>(malloc_usable_size(p)),
+                           std::memory_order_relaxed);
+    std::free(p);
+  }
+}
+}  // namespace
+
+void* operator new(std::size_t n)
+{
+  return track(std::malloc(n));
+}
+void* operator new[](std::size_t n)
+{
+  return track(std::malloc(n));
+}
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept
+{
+  void* p = std::malloc(n);
+  if(p)
+  {
+    track(p);
+  }
+  return p;
+}
+void* operator new(std::size_t n, std::align_val_t a)
+{
+  return track(
+      std::aligned_alloc(static_cast<size_t>(a), (n + static_cast<size_t>(a) - 1) &
+                                                     ~(static_cast<size_t>(a) - 1)));
+}
+void operator delete(void* p) noexcept
+{
+  untrack(p);
+}
+void operator delete[](void* p) noexcept
+{
+  untrack(p);
+}
+void operator delete(void* p, std::size_t) noexcept
+{
+  untrack(p);
+}
+void operator delete[](void* p, std::size_t) noexcept
+{
+  untrack(p);
+}
+void operator delete(void* p, std::align_val_t) noexcept
+{
+  untrack(p);
+}
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept
+{
+  untrack(p);
+}
+
+namespace
+{
+using namespace bench;
+
+struct Snapshot
+{
+  int64_t live, allocs, total;
+};
+
+int64_t heapInUse()
+{
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+  const auto info = mallinfo2();
+  return int64_t(info.uordblks + info.hblkhd);
+#else
+  return g_live_bytes.load();  // C++ allocations only
+#endif
+}
+
+Snapshot snap()
+{
+  return { heapInUse(), g_allocs.load(), g_total_bytes.load() };
+}
+
+struct Result
+{
+  std::string name;
+  std::vector<std::pair<std::string, double>> metrics;
+};
+std::vector<Result> g_results;
+
+void add(const std::string& name, std::vector<std::pair<std::string, double>> m)
+{
+  g_results.push_back({ name, std::move(m) });
+}
+
+// Footprint of a loaded tree, per node (live bytes still held after creation,
+// and total allocation count during creation, minus the empty-factory baseline).
+struct TreeCost
+{
+  double live = 0;
+  double allocs = 0;
+  double total = 0;
+};
+
+TreeCost createTreeCost(const std::string& xml,
+                        const std::function<void(BT::Blackboard&)>& setup)
+{
+  BT::BehaviorTreeFactory f;
+  registerBenchNodes(f);
+  auto bb = BT::Blackboard::create();
+  if(setup)
+  {
+    setup(*bb);
+  }
+  const auto before = snap();
+  auto tree = std::make_unique<BT::Tree>(f.createTreeFromText(xml, bb));
+  const auto after = snap();
+  return { double(after.live - before.live), double(after.allocs - before.allocs),
+           double(after.total - before.total) };
+}
+
+// Heap held by a tree of `size` repetitions (`nodes(size)` nodes). The per-node
+// values are the difference between a small and a large tree: what doesn't
+// grow with the tree, and the granularity of the allocators (e.g. the unused end
+// of a memory chunk), are divided by thousands of nodes.
+void footprint(const std::string& name, const std::function<std::string(int)>& xml,
+               const std::function<int(int)>& nodes, int small, int large,
+               const std::function<void(BT::Blackboard&)>& setup = {})
+{
+  const TreeCost a = createTreeCost(xml(small), setup);
+  const TreeCost b = createTreeCost(xml(large), setup);
+  const double delta_nodes = nodes(large) - nodes(small);
+  add(name, { { "nodes", double(nodes(large)) },
+              { "live_bytes", b.live },
+              { "live_bytes_per_node", (b.live - a.live) / delta_nodes },
+              { "allocs", b.allocs },
+              { "allocs_per_node", (b.allocs - a.allocs) / delta_nodes },
+              { "alloc_bytes_total", b.total } });
+}
+
+// Allocations performed by one steady-state tick, after warm-up.
+void tickAllocs(const std::string& name, const std::string& xml,
+                const std::function<void(BT::Blackboard&)>& setup = {})
+{
+  BT::BehaviorTreeFactory f;
+  registerBenchNodes(f);
+  auto bb = BT::Blackboard::create();
+  if(setup)
+  {
+    setup(*bb);
+  }
+  auto tree = f.createTreeFromText(xml, bb);
+  for(int i = 0; i < 10; i++)
+  {
+    tree.tickExactlyOnce();
+  }
+  constexpr int kTicks = 100;
+  const auto before = snap();
+  for(int i = 0; i < kTicks; i++)
+  {
+    tree.tickExactlyOnce();
+  }
+  const auto after = snap();
+  add(name, { { "allocs_per_tick", double(after.allocs - before.allocs) / kTicks },
+              { "bytes_per_tick", double(after.total - before.total) / kTicks } });
+}
+
+void writeJson(const std::string& path)
+{
+  std::ofstream out(path);
+  out << "{\n  \"results\": [\n";
+  for(size_t i = 0; i < g_results.size(); i++)
+  {
+    out << "    {\"name\": \"" << g_results[i].name << "\"";
+    for(const auto& [k, v] : g_results[i].metrics)
+    {
+      out << ", \"" << k << "\": " << v;
+    }
+    out << "}" << (i + 1 < g_results.size() ? "," : "") << "\n";
+  }
+  out << "  ]\n}\n";
+}
+
+void printTable()
+{
+  for(const auto& r : g_results)
+  {
+    std::printf("%-44s", r.name.c_str());
+    for(const auto& [k, v] : r.metrics)
+    {
+      std::printf("  %s=%.1f", k.c_str(), v);
+    }
+    std::printf("\n");
+  }
+}
+}  // namespace
+
+int main(int argc, char** argv)
+{
+  std::string json_path;
+  for(int i = 1; i < argc; i++)
+  {
+    if(std::strncmp(argv[i], "--json=", 7) == 0)
+    {
+      json_path = argv[i] + 7;
+    }
+  }
+
+  // ---- factory ----
+  {
+    const auto before = snap();
+    auto f = std::make_unique<BT::BehaviorTreeFactory>();
+    const auto after = snap();
+    add("Factory/construct", { { "live_bytes", double(after.live - before.live) },
+                               { "allocs", double(after.allocs - before.allocs) } });
+  }
+
+  // ---- tree footprint ----
+  const auto sequence_of = [](const std::string& leaf) {
+    return [leaf](int n) { return repeatLeaf("Sequence", leaf, n); };
+  };
+  const auto plus_root = [](int n) { return n + 1; };
+  const auto set_x = [](BT::Blackboard& bb) { bb.set("x", 1); };
+  footprint("Footprint/Sequence_of_Ok", sequence_of("<Ok/>"), plus_root, 2000, 10000);
+  footprint("Footprint/Sequence_of_ReadInt_bb", sequence_of("<ReadInt value=\"{x}\"/>"),
+            plus_root, 2000, 10000, set_x);
+  footprint("Footprint/Sequence_of_ReadInt_literal",
+            sequence_of("<ReadInt value=\"42\"/>"), plus_root, 2000, 10000);
+  footprint("Footprint/Sequence_of_PreCondition",
+            sequence_of("<Ok _skipIf=\"x &gt; 100\"/>"), plus_root, 2000, 10000, set_x);
+  // chains of 32 nested Sequence
+  std::string chain = "<Ok/>";
+  for(int i = 0; i < 32; i++)
+  {
+    chain = "<Sequence>" + chain + "</Sequence>";
+  }
+  footprint(
+      "Footprint/Nested_Sequence_depth32", sequence_of(chain),
+      [](int n) { return 1 + n * 33; }, 60, 300);
+
+  // ---- steady-state tick allocations ----
+  tickAllocs("Tick/Sequence_of_Ok", repeatLeaf("Sequence", "<Ok/>", 100));
+  tickAllocs("Tick/ReadInt_bb", repeatLeaf("Sequence", "<ReadInt value=\"{x}\"/>", 100),
+             [](BT::Blackboard& bb) { bb.set("x", 1); });
+  tickAllocs("Tick/ReadInt_literal",
+             repeatLeaf("Sequence", "<ReadInt value=\"42\"/>", 100));
+  tickAllocs("Tick/ReadInt_default", repeatLeaf("Sequence", "<ReadIntDefault/>", 100));
+  tickAllocs("Tick/ReadString_bb",
+             repeatLeaf("Sequence", "<ReadString value=\"{s}\"/>", 100),
+             [](BT::Blackboard& bb) { bb.set("s", std::string(64, 'x')); });
+  tickAllocs("Tick/WriteInt_bb", repeatLeaf("Sequence", "<WriteInt value=\"{x}\"/>", 100),
+             [](BT::Blackboard& bb) { bb.set("x", 1); });
+  tickAllocs("Tick/PreCondition",
+             repeatLeaf("Sequence", "<Ok _skipIf=\"x &gt; 100\"/>", 100),
+             [](BT::Blackboard& bb) { bb.set("x", 1); });
+  tickAllocs("Tick/ReactiveSequence_Running",
+             repeatLeaf("ReactiveSequence", "<Ok/>", 100, "<Running/>"));
+
+  printTable();
+  if(!json_path.empty())
+  {
+    writeJson(json_path);
+    std::printf("\nwrote %s\n", json_path.c_str());
+  }
+  return 0;
+}

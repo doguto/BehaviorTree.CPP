@@ -184,6 +184,10 @@ private:
 
   std::shared_ptr<Entry> createEntryImpl(const std::string& key, const TypeInfo& info);
 
+  // The existing entry that createEntryImpl(key) would return from a parent
+  // blackboard (through remapping), or nullptr. Read-only: shared locks only.
+  [[nodiscard]] std::shared_ptr<Entry> findRemappedEntry(const std::string& key) const;
+
   bool autoremapping_ = false;
 
   // Optional registry for polymorphic shared_ptr conversions
@@ -243,6 +247,15 @@ inline T Blackboard::get(const std::string& key) const
       throw RuntimeError("Blackboard::get() error. Entry [", key,
                          "] hasn't been initialized, yet");
     }
+    if constexpr(!std::is_same_v<T, float>)
+    {
+      // Stored with exactly this type: copy it directly, without the
+      // intermediate copies of tryCast()
+      if(const T* direct = any_ref->template castPtr<T>())
+      {
+        return *direct;
+      }
+    }
     auto result = tryCastWithPolymorphicFallback<T>(any);
     if(!result)
     {
@@ -282,9 +295,31 @@ inline void Blackboard::set(const std::string& key, const T& value)
   auto it = storage_.find(key);
   if(it == storage_.end())
   {
+    storage_lock.unlock();
+    // Usually the entry exists in a parent blackboard (remapping): write it
+    // directly, as createEntryImpl() below would return it, unless the type
+    // differs (let createEntryImpl() report the error).
+    if(auto entry = findRemappedEntry(key))
+    {
+      Any new_value(value);
+      bool new_strongly_typed = false;
+      if constexpr(!std::is_same_v<std::string, T>)
+      {
+        new_strongly_typed = new_value.type() != typeid(AnyTypeAllowed) &&
+                             new_value.type() != typeid(BT::Any);
+      }
+      std::scoped_lock entry_lock(entry->entry_mutex);
+      if(!new_strongly_typed || !entry->info.isStronglyTyped() ||
+         entry->info.type() == new_value.type())
+      {
+        entry->value = std::move(new_value);
+        entry->sequence_id++;
+        entry->stamp = std::chrono::steady_clock::now().time_since_epoch();
+        return;
+      }
+    }
     // create a new entry
     Any new_value(value);
-    storage_lock.unlock();
     std::shared_ptr<Blackboard::Entry> entry;
     // if a new generic port is created with a string, it's type should be AnyTypeAllowed
     if constexpr(std::is_same_v<std::string, T>)
@@ -324,7 +359,11 @@ inline void Blackboard::set(const std::string& key, const T& value)
     if(!entry.info.isStronglyTyped())
     {
       // Use the new type to create a new entry that is strongly typed.
-      entry.info = TypeInfo::Create<T>();
+      // (set<Any> keeps it untyped: don't build the same TypeInfo again)
+      if(!std::is_same_v<T, Any> || entry.info.type() != typeid(Any))
+      {
+        entry.info = TypeInfo::Create<T>();
+      }
       entry.sequence_id++;
       entry.stamp = std::chrono::steady_clock::now().time_since_epoch();
       previous_any = std::move(new_value);
@@ -394,6 +433,16 @@ inline bool Blackboard::get(const std::string& key, T& value) const
     if(any->empty())
     {
       return false;
+    }
+    if constexpr(!std::is_same_v<T, float>)
+    {
+      // Stored with exactly this type: copy it directly, without the
+      // intermediate copies of tryCast()
+      if(const T* direct = any_ref->template castPtr<T>())
+      {
+        value = *direct;
+        return true;
+      }
     }
     auto result = tryCastWithPolymorphicFallback<T>(any);
     if(!result)

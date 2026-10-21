@@ -15,9 +15,11 @@
 #include "behaviortree_cpp/scripting/any_types.hpp"
 #include "behaviortree_cpp/scripting/script_parser.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 // Naive implementation of an AST with simple evaluation function.
@@ -95,14 +97,43 @@ struct ExprName : ExprBase
         return Any(double(enum_ptr->second));
       }
     }
-    // search now in the variables table
-    auto any_ref = env.vars->getAnyLocked(name);
-    if(!any_ref)
+    // search now in the variables table: the entry found by the previous
+    // evaluation, while the structure of the blackboards didn't change
+    while(bind_lock_.test_and_set(std::memory_order_acquire))
+    {
+      std::this_thread::yield();
+    }
+    struct Unlock
+    {
+      std::atomic_flag& flag;
+      ~Unlock()
+      {
+        flag.clear(std::memory_order_release);
+      }
+    } unlock{ bind_lock_ };
+
+    const uint64_t version = Blackboard::structureVersion();
+    if(bound_vars_ != env.vars.get() || bound_version_ != version)
+    {
+      bound_entry_ = env.vars->getEntry(name);
+      bound_vars_ = env.vars.get();
+      // a missing entry may be created later: not cached
+      bound_version_ = bound_entry_ ? version : 0;
+    }
+    if(!bound_entry_)
     {
       throw RuntimeError(StrCat("Variable not found: ", name));
     }
-    return *any_ref.get();
+    const std::scoped_lock entry_lock(bound_entry_->entry_mutex);
+    return bound_entry_->value;
   }
+
+private:
+  // Guards the members below
+  mutable std::atomic_flag bind_lock_ = ATOMIC_FLAG_INIT;
+  mutable const Blackboard* bound_vars_ = nullptr;
+  mutable uint64_t bound_version_ = 0;
+  mutable std::shared_ptr<Blackboard::Entry> bound_entry_;
 };
 
 struct ExprUnaryArithmetic : ExprBase

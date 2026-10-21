@@ -27,6 +27,7 @@
 #include <map>
 #include <new>
 #include <optional>
+#include <thread>
 #include <utility>
 
 #ifdef _MSC_VER
@@ -176,8 +177,8 @@ using PreconvertedLiterals =
     LiteralTypeList<bool, double, float, int32_t, uint32_t, int64_t, uint64_t, int16_t,
                     uint16_t, int8_t, uint8_t>;
 
-// An input port of a node, resolved once from its configuration (which can't
-// change after the node is created, see TreeNode::config()).
+// A port of a node, resolved once from its configuration (which can't change
+// after the node is created, see TreeNode::config()).
 struct PortSlot
 {
   enum Kind : uint8_t
@@ -186,21 +187,55 @@ struct PortSlot
     Blackboard
   };
   Kind kind = Literal;
-  // Literal of a port declared as a string (or without converter): reading it as
-  // a std::string is a copy.
+  // An output port (in output_ports), otherwise an input port
+  bool output = false;
+  // Input literal of a port declared as a string (or without converter): reading
+  // it as a std::string is a copy.
   bool string_identity = false;
-  // Literal converted once to the declared type of the port, if it is one of
-  // PreconvertedLiterals: its index there (0 otherwise), and the value.
+  // Input literal converted once to the declared type of the port, if it is one
+  // of PreconvertedLiterals: its index there (0 otherwise), and the value.
   uint8_t literal_type = 0;
+  // Output: setOutput<Any>() is allowed (port declared as Any)
+  bool any_output_allowed = false;
+  // Blackboard: guards the bound_* members, held while the entry is read
+  mutable std::atomic_flag bind_lock = ATOMIC_FLAG_INIT;
+  // Output: bound_entry is in config().blackboard itself, not in a parent
+  // (Blackboard::set() checks the type differently)
+  mutable bool bound_local = false;
   uint32_t name_size = 0;
   // first 8 characters of the name, zero padded: compared before the name itself
   uint64_t name_prefix = 0;
-  const std::string* name = nullptr;   // key in config().input_ports
-  const std::string* value = nullptr;  // value in config().input_ports
+  const std::string* name = nullptr;   // key in config().input_ports / output_ports
+  const std::string* value = nullptr;  // its value
   alignas(8) unsigned char literal_value[8] = {};
   // Blackboard: the key of the entry, i.e. "{key}" without braces (points into
   // the name or the value)
   StringView blackboard_key;
+  // Blackboard: the entry found by the last call, which getEntry() keeps
+  // returning while Blackboard::structureVersion() == bound_version (0: none)
+  mutable uint64_t bound_version = 0;
+  mutable std::shared_ptr<Blackboard::Entry> bound_entry;
+};
+
+class PortSlotLock
+{
+public:
+  explicit PortSlotLock(const PortSlot& slot) : slot_(slot)
+  {
+    while(slot_.bind_lock.test_and_set(std::memory_order_acquire))
+    {
+      std::this_thread::yield();
+    }
+  }
+  ~PortSlotLock()
+  {
+    slot_.bind_lock.clear(std::memory_order_release);
+  }
+  PortSlotLock(const PortSlotLock&) = delete;
+  PortSlotLock& operator=(const PortSlotLock&) = delete;
+
+private:
+  const PortSlot& slot_;
 };
 
 inline uint64_t portNamePrefix(const std::string& name)
@@ -552,8 +587,16 @@ private:
 
   void notifyStatusChange(NodeStatus prev_status, NodeStatus new_status);
 
-  // The resolved input port `key`, or nullptr if it is not in input_ports.
-  [[nodiscard]] const details::PortSlot* findPortSlot(const std::string& key) const;
+  // The resolved input (or output) port `key`, or nullptr if it is not in
+  // input_ports (output_ports).
+  [[nodiscard]] const details::PortSlot* findPortSlot(const std::string& key,
+                                                      bool output = false) const;
+
+  // The entry of a blackboard port, found again only when the structure of the
+  // blackboards changed. Call while holding a PortSlotLock.
+  [[nodiscard]] Blackboard::Entry* boundEntry(const details::PortSlot& slot) const;
+  // Same for an output port: the entry that Blackboard::set() would write.
+  [[nodiscard]] Blackboard::Entry* boundOutputEntry(const details::PortSlot& slot) const;
 
   // Resolve the input ports now instead of at the first getInput() (Tree, once
   // the tree is created).
@@ -798,7 +841,20 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
                                      "an invalid Blackboard");
     }
 
-    if(auto entry = config().blackboard->getEntry(std::string(blackboard_key)))
+    std::optional<details::PortSlotLock> slot_lock;
+    std::shared_ptr<Blackboard::Entry> entry_holder;
+    Blackboard::Entry* entry = nullptr;
+    if(slot != nullptr)
+    {
+      slot_lock.emplace(*slot);
+      entry = boundEntry(*slot);
+    }
+    else
+    {
+      entry_holder = config().blackboard->getEntry(std::string(blackboard_key));
+      entry = entry_holder.get();
+    }
+    if(entry != nullptr)
     {
       std::unique_lock lk(entry->entry_mutex);
       auto& any_value = entry->value;
@@ -864,6 +920,31 @@ inline Result TreeNode::setOutput(const std::string& key, const T& value)
   {
     return nonstd::make_unexpected("setOutput() failed: trying to access a "
                                    "Blackboard(BB) entry, but BB is invalid");
+  }
+
+  // Fast path: the entry of the port was found by a previous call
+  if(const details::PortSlot* slot = findPortSlot(key, true);
+     slot != nullptr && slot->kind == details::PortSlot::Blackboard &&
+     !slot->blackboard_key.empty() && slot->blackboard_key.front() != '@' &&
+     (!std::is_same_v<T, Any> || slot->any_output_allowed))
+  {
+    const details::PortSlotLock slot_lock(*slot);
+    Blackboard& blackboard = *config().blackboard;
+    if(Blackboard::Entry* entry = boundOutputEntry(*slot))
+    {
+      if(slot->bound_local)
+      {
+        blackboard.writeExistingEntry(slot->blackboard_key, *entry, value);
+        return {};
+      }
+      if(blackboard.writeRemappedEntry(*entry, value))
+      {
+        return {};
+      }
+    }
+    // no entry yet, or type mismatch: set() creates it, or reports the error
+    blackboard.set(std::string(slot->blackboard_key), value);
+    return {};
   }
 
   auto remap_it = config().output_ports.find(key);

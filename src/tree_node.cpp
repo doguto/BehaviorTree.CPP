@@ -244,7 +244,7 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
       }
       return table;
     }
-    // shared by the nodes without input ports
+    // shared by the nodes without ports
     static PortTable* empty()
     {
       static PortTable no_ports;
@@ -470,10 +470,34 @@ void preconvertLiteral(details::LiteralTypeList<Ts...> /*types*/, const PortInfo
 const TreeNode::PImpl::PortTable* TreeNode::PImpl::buildPortTable() const
 {
   std::unique_ptr<PortTable, void (*)(PortTable*)> table(
-      config.input_ports.empty() ? PortTable::empty() :
-                                   PortTable::create(config.input_ports.size()),
+      config.input_ports.empty() && config.output_ports.empty() ?
+          PortTable::empty() :
+          PortTable::create(config.input_ports.size() + config.output_ports.size()),
       &PortTable::destroy);
   size_t i = 0;
+  for(const auto& [name, value] : config.output_ports)
+  {
+    details::PortSlot& slot = table->slots()[i++];
+    slot.output = true;
+    slot.name = &name;
+    slot.value = &value;
+    slot.name_size = static_cast<uint32_t>(name.size());
+    slot.name_prefix = details::portNamePrefix(name);
+    if(auto key = TreeNode::blackboardKeyOf(name, value))
+    {
+      slot.kind = details::PortSlot::Blackboard;
+      slot.blackboard_key = *key;
+    }
+    if(config.manifest)
+    {
+      if(auto it = config.manifest->ports.find(name); it != config.manifest->ports.end())
+      {
+        const auto& type = it->second.type();
+        slot.any_output_allowed =
+            type == typeid(BT::Any) || type == typeid(BT::AnyTypeAllowed);
+      }
+    }
+  }
   for(const auto& [name, value] : config.input_ports)
   {
     details::PortSlot& slot = table->slots()[i++];
@@ -526,7 +550,39 @@ void TreeNode::setManifest(const TreeNodeManifest* manifest)
   _p->config.manifest = manifest;
 }
 
-const details::PortSlot* TreeNode::findPortSlot(const std::string& key) const
+Blackboard::Entry* TreeNode::boundEntry(const details::PortSlot& slot) const
+{
+  // read before getEntry(): a change meanwhile makes the next call look again
+  const uint64_t version = Blackboard::structureVersion();
+  if(slot.bound_version != version)
+  {
+    slot.bound_entry = config().blackboard->getEntry(std::string(slot.blackboard_key));
+    // a missing entry may be created later: not cached
+    slot.bound_version = slot.bound_entry ? version : 0;
+  }
+  return slot.bound_entry.get();
+}
+
+Blackboard::Entry* TreeNode::boundOutputEntry(const details::PortSlot& slot) const
+{
+  const uint64_t version = Blackboard::structureVersion();
+  if(slot.bound_version != version)
+  {
+    // same lookup as Blackboard::set()
+    const Blackboard& blackboard = *config().blackboard;
+    const std::string key(slot.blackboard_key);
+    slot.bound_entry = blackboard.findLocalEntry(key);
+    slot.bound_local = static_cast<bool>(slot.bound_entry);
+    if(!slot.bound_entry)
+    {
+      slot.bound_entry = blackboard.findRemappedEntry(key);
+    }
+    slot.bound_version = slot.bound_entry ? version : 0;
+  }
+  return slot.bound_entry.get();
+}
+
+const details::PortSlot* TreeNode::findPortSlot(const std::string& key, bool output) const
 {
   const PImpl::PortTable* table = _p->port_table.load(std::memory_order_acquire);
   if(table == nullptr)
@@ -537,8 +593,8 @@ const details::PortSlot* TreeNode::findPortSlot(const std::string& key) const
   for(size_t i = 0; i < table->size; i++)
   {
     const details::PortSlot& slot = table->slots()[i];
-    if(slot.name_size == key.size() && slot.name_prefix == prefix &&
-       (key.size() <= sizeof(prefix) || *slot.name == key))
+    if(slot.output == output && slot.name_size == key.size() &&
+       slot.name_prefix == prefix && (key.size() <= sizeof(prefix) || *slot.name == key))
     {
       return &slot;
     }

@@ -840,3 +840,36 @@ TEST(BlackboardTest, GetLockedPortContentWithDefault_Issue942)
   // The value should be accessible from the blackboard
   ASSERT_EQ(tree.rootBlackboard()->get<int>("value"), 42);
 }
+
+TEST(BlackboardTest, GetSameAndConvertedTypes)
+{
+  auto bb = Blackboard::create();
+  const std::vector<int> vect = { 1, 2, 3 };
+  const std::string text = "a string long enough to not fit any small-string buffer";
+  bb->set("vect", vect);
+  bb->set("text", text);
+  bb->set("int", 42);
+  bb->set("double", 0.5);
+
+  // same type as stored
+  std::vector<int> v_out = { 9 };
+  ASSERT_TRUE(bb->get("vect", v_out));
+  EXPECT_EQ(v_out, vect);
+  EXPECT_EQ(bb->get<std::vector<int>>("vect"), vect);
+  std::string s_out = "old";
+  ASSERT_TRUE(bb->get("text", s_out));
+  EXPECT_EQ(s_out, text);
+  EXPECT_EQ(bb->get<std::string>("text"), text);
+  EXPECT_EQ(bb->get<int>("int"), 42);
+
+  // converted
+  EXPECT_EQ(bb->get<double>("int"), 42.0);
+  EXPECT_EQ(bb->get<long>("int"), 42L);
+  EXPECT_FLOAT_EQ(bb->get<float>("double"), 0.5f);
+  float f_out = 0;
+  ASSERT_TRUE(bb->get("double", f_out));
+  EXPECT_FLOAT_EQ(f_out, 0.5f);
+
+  // wrong type
+  EXPECT_ANY_THROW((void)bb->get<std::vector<int>>("text"));
+}

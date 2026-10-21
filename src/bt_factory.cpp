@@ -94,6 +94,42 @@ std::string loadXmlAndResolveTreeId(Parser* parser, const std::string& main_tree
 
 }  // namespace
 
+namespace
+{
+// The timer thread shared by the Delay and Sleep nodes of a factory, when
+// enabled: created by the first node that needs it, stopped with the last one.
+class SharedTimers
+{
+public:
+  void setEnabled(bool enabled)
+  {
+    const std::scoped_lock lk(mutex_);
+    enabled_ = enabled;
+  }
+
+  std::shared_ptr<SharedTimerQueue> get()
+  {
+    const std::scoped_lock lk(mutex_);
+    if(!enabled_)
+    {
+      return nullptr;
+    }
+    auto queue = queue_.lock();
+    if(!queue)
+    {
+      queue = std::make_shared<SharedTimerQueue>();
+      queue_ = queue;
+    }
+    return queue;
+  }
+
+private:
+  std::mutex mutex_;
+  bool enabled_ = false;
+  std::weak_ptr<SharedTimerQueue> queue_;
+};
+}  // namespace
+
 bool WildcardMatch(std::string const& str, StringView filter)
 {
   return wildcards_match(str, { filter.data(), filter.size() });
@@ -109,6 +145,8 @@ struct BehaviorTreeFactory::PImpl
   std::shared_ptr<BT::Parser> parser;
   std::unordered_map<std::string, SubstitutionRule> substitution_rules;
   std::shared_ptr<PolymorphicCastRegistry> polymorphic_registry;
+  // shared with the builders of Delay and Sleep
+  std::shared_ptr<SharedTimers> shared_timers = std::make_shared<SharedTimers>();
 };
 
 BehaviorTreeFactory::BehaviorTreeFactory() : _p(new PImpl)
@@ -139,7 +177,11 @@ BehaviorTreeFactory::BehaviorTreeFactory() : _p(new PImpl)
   registerNodeType<KeepRunningUntilFailureNode>("KeepRunningUntilFailure");
   registerNodeType<RepeatNode>("Repeat");
   registerNodeType<TimeoutNode>("Timeout");
-  registerNodeType<DelayNode>("Delay");
+  registerBuilder(
+      CreateManifest<DelayNode>("Delay"),
+      [timers = _p->shared_timers](const std::string& name, const NodeConfig& config) {
+        return std::make_unique<DelayNode>(name, config, timers->get());
+      });
   registerNodeType<RunOnceNode>("RunOnce");
 
   registerNodeType<ForceSuccessNode>("ForceSuccess");
@@ -150,7 +192,11 @@ BehaviorTreeFactory::BehaviorTreeFactory() : _p(new PImpl)
   registerNodeType<ScriptNode>("Script");
   registerNodeType<ScriptCondition>("ScriptCondition");
   registerNodeType<SetBlackboardNode>("SetBlackboard");
-  registerNodeType<SleepNode>("Sleep");
+  registerBuilder(
+      CreateManifest<SleepNode>("Sleep"),
+      [timers = _p->shared_timers](const std::string& name, const NodeConfig& config) {
+        return std::make_unique<SleepNode>(name, config, timers->get());
+      });
   registerNodeType<UnsetBlackboardNode>("UnsetBlackboard");
 
   registerNodeType<SubTreeNode>("SubTree");
@@ -185,6 +231,11 @@ BehaviorTreeFactory::~BehaviorTreeFactory() = default;
 BehaviorTreeFactory::BehaviorTreeFactory(BehaviorTreeFactory&& other) noexcept = default;
 BehaviorTreeFactory&
 BehaviorTreeFactory::operator=(BehaviorTreeFactory&& other) noexcept = default;
+
+void BehaviorTreeFactory::useSharedTimerThread(bool enable)
+{
+  _p->shared_timers->setEnabled(enable);
+}
 
 bool BehaviorTreeFactory::unregisterBuilder(const std::string& ID)
 {

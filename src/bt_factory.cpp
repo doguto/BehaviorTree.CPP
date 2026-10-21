@@ -624,6 +624,9 @@ void Tree::remapManifestPointers()
 void Tree::initialize()
 {
   wake_up_ = std::make_shared<WakeUpSignal>();
+  root_ = (subtrees.empty() || subtrees.front()->nodes.empty()) ?
+              nullptr :
+              subtrees.front()->nodes.front();
   for(auto& subtree : subtrees)
   {
     for(auto& node : subtree->nodes)
@@ -727,12 +730,13 @@ NodeStatus Tree::tickRoot(TickOption opt, std::chrono::milliseconds sleep_time)
 {
   NodeStatus status = NodeStatus::IDLE;
 
-  if(!wake_up_)
+  if(!wake_up_ || !root_)
   {
     initialize();
   }
 
-  if(rootNode() == nullptr)
+  TreeNode* root = root_.get();
+  if(root == nullptr)
   {
     throw RuntimeError("Empty Tree");
   }
@@ -740,19 +744,19 @@ NodeStatus Tree::tickRoot(TickOption opt, std::chrono::milliseconds sleep_time)
   while(status == NodeStatus::IDLE ||
         (opt == TickOption::WHILE_RUNNING && status == NodeStatus::RUNNING))
   {
-    status = rootNode()->executeTick();
+    status = root->executeTick();
 
     // Inner loop. The previous tick might have triggered the wake-up
     // in this case, unless TickOption::EXACTLY_ONCE, we tick again
     while(opt != TickOption::EXACTLY_ONCE && status == NodeStatus::RUNNING &&
           wake_up_->waitFor(std::chrono::milliseconds(0)))
     {
-      status = rootNode()->executeTick();
+      status = root->executeTick();
     }
 
     if(isStatusCompleted(status))
     {
-      rootNode()->resetStatus();
+      root->resetStatus();
     }
     if(status == NodeStatus::RUNNING && sleep_time.count() > 0)
     {

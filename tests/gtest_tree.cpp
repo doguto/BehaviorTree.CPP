@@ -14,6 +14,7 @@
 #include "condition_test_node.h"
 
 #include "behaviortree_cpp/behavior_tree.h"
+#include "behaviortree_cpp/bt_factory.h"
 
 #include <sstream>
 #include <string>
@@ -125,4 +126,30 @@ int main(int argc, char** argv)
 {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST(BehaviorTree, TickAfterMoveAndEmptyTree)
+{
+  BT::BehaviorTreeFactory factory;
+  auto make = [&] {
+    return factory.createTreeFromText(R"(
+<root BTCPP_format="4">
+  <BehaviorTree ID="Main">
+    <Sequence>
+      <AlwaysSuccess/>
+    </Sequence>
+  </BehaviorTree>
+</root>)");
+  };
+  BT::Tree tree = make();
+  ASSERT_EQ(tree.tickExactlyOnce(), BT::NodeStatus::SUCCESS);
+
+  // the root node moves with the tree
+  BT::Tree moved = std::move(tree);
+  ASSERT_EQ(moved.tickOnce(), BT::NodeStatus::SUCCESS);
+  moved = make();
+  ASSERT_EQ(moved.tickWhileRunning(), BT::NodeStatus::SUCCESS);
+
+  BT::Tree empty;
+  EXPECT_THROW((void)empty.tickExactlyOnce(), BT::RuntimeError);
 }

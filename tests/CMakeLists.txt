@@ -45,6 +45,7 @@ set(BT_TESTS
   gtest_substitution.cpp
   gtest_subtree.cpp
   gtest_switch.cpp
+  gtest_get_input.cpp
   gtest_tick_hooks.cpp
   gtest_tree.cpp
   gtest_try_catch.cpp

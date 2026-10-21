@@ -13,34 +13,244 @@
 
 #include "behaviortree_cpp/tree_node.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <optional>
 #include <vector>
 
 namespace BT
 {
 
-struct TreeNode::PImpl
+namespace
+{
+// Allocator for the data of the nodes (TreeNode::PImpl and its condition scripts).
+//
+// The nodes of a tree are created one after the other and ticked in the same
+// (depth-first) order. Allocating their data next to each other keeps a tree
+// compact in memory whatever the state of the heap: in a long-running process
+// the general allocator scatters them into the holes left by previous
+// allocations, and a tick then misses the cache on every node.
+//
+// Memory comes in chunks of kChunkSize bytes. Each thread fills its own current
+// chunk with 64-byte aligned slots. The last 8 bytes of a slot point back to
+// the chunk, found with the (sized) delete. A chunk is freed when its last
+// object is destroyed (by any thread) and no thread is filling it anymore.
+// The space of destroyed objects is not reused before that: fine for nodes,
+// which live as long as their tree.
+class NodeDataArena
+{
+public:
+  static constexpr size_t kChunkSize = 64 * 1024;
+  static constexpr size_t kAlign = 64;
+
+  static void* allocate(size_t size)
+  {
+    const size_t slot = slotSize(size);
+    Chunk*& current = threadChunk().chunk;
+    if(current == nullptr || current->next + slot > current->end)
+    {
+      Chunk* fresh = newChunk(slot);
+      release(current);  // this thread does not fill it anymore
+      current = fresh;
+    }
+    char* ptr = current->next;
+    current->next += slot;
+    backPointer(ptr, size) = current;
+    current->refs.fetch_add(1, std::memory_order_relaxed);
+    return ptr;
+  }
+
+  // `size` must be the one given to allocate()
+  static void deallocate(void* ptr, size_t size) noexcept
+  {
+    if(ptr != nullptr)
+    {
+      release(backPointer(static_cast<char*>(ptr), size));
+    }
+  }
+
+private:
+  struct Chunk
+  {
+    // live objects, +1 while a thread fills the chunk
+    std::atomic<size_t> refs{ 1 };
+    // free space. Only accessed by the thread filling the chunk.
+    char* next = nullptr;
+    char* end = nullptr;
+  };
+
+  static constexpr size_t slotSize(size_t size)
+  {
+    return (size + sizeof(Chunk*) + kAlign - 1) & ~(kAlign - 1);
+  }
+
+  static Chunk*& backPointer(char* ptr, size_t size)
+  {
+    return *reinterpret_cast<Chunk**>(ptr + slotSize(size) - sizeof(Chunk*));
+  }
+
+  static Chunk* newChunk(size_t min_slot)
+  {
+    const size_t bytes = std::max(kChunkSize, min_slot + sizeof(Chunk) + kAlign);
+    void* mem = std::malloc(bytes);
+    if(mem == nullptr)
+    {
+      throw std::bad_alloc();
+    }
+    auto* chunk = new(mem) Chunk;
+    const auto first = reinterpret_cast<std::uintptr_t>(chunk + 1);
+    chunk->next =
+        reinterpret_cast<char*>((first + kAlign - 1) & ~std::uintptr_t(kAlign - 1));
+    chunk->end = static_cast<char*>(mem) + bytes;
+    return chunk;
+  }
+
+  static void release(Chunk* chunk) noexcept
+  {
+    if(chunk != nullptr && chunk->refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    {
+      chunk->~Chunk();
+      std::free(chunk);
+    }
+  }
+
+  struct ThreadChunk
+  {
+    Chunk* chunk = nullptr;
+    ~ThreadChunk()
+    {
+      release(chunk);
+    }
+  };
+
+  static ThreadChunk& threadChunk()
+  {
+    thread_local ThreadChunk thread_chunk;
+    return thread_chunk;
+  }
+};
+
+// Base class: allocate the derived type with NodeDataArena.
+// The derived type must be final, so that delete gets the allocated size.
+struct ArenaAllocated
+{
+  static void* operator new(std::size_t size)
+  {
+    return NodeDataArena::allocate(size);
+  }
+  static void* operator new(std::size_t size, std::align_val_t align)
+  {
+    if(static_cast<size_t>(align) > NodeDataArena::kAlign)
+    {
+      throw std::bad_alloc();
+    }
+    return NodeDataArena::allocate(size);
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept
+  {
+    NodeDataArena::deallocate(ptr, size);
+  }
+  static void operator delete(void* ptr, std::size_t size, std::align_val_t) noexcept
+  {
+    NodeDataArena::deallocate(ptr, size);
+  }
+};
+}  // namespace
+
+// Fields are ordered by access frequency: the first block is read or written by
+// every tick and fits in two cache lines (the struct is cache-line aligned), so
+// a tick touches as few lines as possible when the tree is not in the cache.
+// It is allocated next to the data of the nodes created before and after it.
+struct alignas(64) TreeNode::PImpl final : ArenaAllocated
 {
   PImpl(std::string name, NodeConfig config)
-    : name(std::move(name)), config(std::move(config))
+    : config(std::move(config)), name(std::move(name))
   {}
 
-  const std::string name;
+  //---------- hot: used by every tick ----------
+  mutable std::mutex state_mutex;
 
   NodeStatus status = NodeStatus::IDLE;
 
-  std::condition_variable state_condition_variable;
-
-  mutable std::mutex state_mutex;
+  // True when at least one injected callback is set. Written while holding
+  // callback_injection_mutex; lets executeTick() skip that mutex otherwise.
+  std::atomic<bool> has_injected_callbacks{ false };
 
   // Number of threads blocked in waitValidStatus(). Guarded by state_mutex,
   // it lets setStatus()/resetStatus() skip notify_all() when nobody waits.
   int status_waiters = 0;
 
   StatusChangeSignal state_change_signal;
+
+  std::shared_ptr<WakeUpSignal> wake_up;
+
+  // Pre/post condition scripts. Allocated only when requested by
+  // preConditionsScripts() / postConditionsScripts() (the only way to set them):
+  // most nodes have none, and executeTick() then skips them entirely.
+  struct ConditionScripts final : ArenaAllocated
+  {
+    PreScripts pre;
+    PostScripts post;
+  };
+  std::unique_ptr<ConditionScripts> scripts;
+
+  //---------- used by ports and introspection ----------
+  NodeConfig config;
+
+  const std::string name;
+
+  std::string registration_ID;
+
+  //---------- rarely used: allocated on first use ----------
+
+  // Created by the first waitValidStatus(), while holding state_mutex, and never
+  // destroyed before the node: a thread that saw status_waiters > 0 under
+  // state_mutex can use it.
+  std::unique_ptr<std::condition_variable> state_condition_variable;
+
+  struct InjectedCallbacks
+  {
+    PreTickCallback pre_tick;
+    PostTickCallback post_tick;
+    TickMonitorCallback tick_monitor;
+  };
+  // Guarded by callback_injection_mutex
+  std::unique_ptr<InjectedCallbacks> callbacks;
+
+  std::mutex callback_injection_mutex;
+
+  // Call while holding callback_injection_mutex
+  InjectedCallbacks& injectedCallbacks()
+  {
+    if(!callbacks)
+    {
+      callbacks = std::make_unique<InjectedCallbacks>();
+    }
+    return *callbacks;
+  }
+
+  // Call while holding callback_injection_mutex
+  void updateInjectedCallbacksFlag()
+  {
+    has_injected_callbacks.store(
+        callbacks &&
+            (callbacks->pre_tick || callbacks->post_tick || callbacks->tick_monitor),
+        std::memory_order_release);
+  }
+
+  ConditionScripts& conditionScripts()
+  {
+    if(!scripts)
+    {
+      scripts = std::make_unique<ConditionScripts>();
+    }
+    return *scripts;
+  }
 
   // Called after a status change, outside state_mutex.
   // The clock is read only if there is a subscriber to receive it.
@@ -49,7 +259,7 @@ struct TreeNode::PImpl
   {
     if(has_waiters)
     {
-      state_condition_variable.notify_all();
+      state_condition_variable->notify_all();
     }
     if(!state_change_signal.empty())
     {
@@ -57,33 +267,43 @@ struct TreeNode::PImpl
                                  prev_status, new_status);
     }
   }
-
-  NodeConfig config;
-
-  std::string registration_ID;
-
-  PreTickCallback pre_tick_callback;
-  PostTickCallback post_tick_callback;
-  TickMonitorCallback tick_monitor_callback;
-
-  std::mutex callback_injection_mutex;
-
-  // True when at least one injected callback is set. Written while holding
-  // callback_injection_mutex; lets executeTick() skip that mutex otherwise.
-  std::atomic<bool> has_injected_callbacks{ false };
-
-  void updateInjectedCallbacksFlag()
-  {
-    has_injected_callbacks.store(pre_tick_callback || post_tick_callback ||
-                                     tick_monitor_callback,
-                                 std::memory_order_release);
-  }
-
-  std::shared_ptr<WakeUpSignal> wake_up;
-
-  std::array<ScriptFunction, size_t(PreCond::COUNT_)> pre_parsed;
-  std::array<ScriptFunction, size_t(PostCond::COUNT_)> post_parsed;
 };
+
+void* TreeNode::operator new(std::size_t size)
+{
+  return NodeDataArena::allocate(size);
+}
+
+void* TreeNode::operator new(std::size_t size, std::align_val_t align)
+{
+  if(static_cast<size_t>(align) > NodeDataArena::kAlign)
+  {
+    throw std::bad_alloc();
+  }
+  return NodeDataArena::allocate(size);
+}
+
+void* TreeNode::operator new(std::size_t size, const std::nothrow_t&) noexcept
+{
+  try
+  {
+    return NodeDataArena::allocate(size);
+  }
+  catch(...)
+  {
+    return nullptr;
+  }
+}
+
+void TreeNode::operator delete(void* ptr, std::size_t size) noexcept
+{
+  NodeDataArena::deallocate(ptr, size);
+}
+
+void TreeNode::operator delete(void* ptr, std::size_t size, std::align_val_t) noexcept
+{
+  NodeDataArena::deallocate(ptr, size);
+}
 
 TreeNode::TreeNode(std::string name, NodeConfig config)
   : _p(new PImpl(std::move(name), std::move(config)))
@@ -109,16 +329,29 @@ NodeStatus TreeNode::executeTick()
   if(_p->has_injected_callbacks.load(std::memory_order_acquire))
   {
     const std::scoped_lock lk(_p->callback_injection_mutex);
-    pre_tick = _p->pre_tick_callback;
-    post_tick = _p->post_tick_callback;
-    monitor_tick = _p->tick_monitor_callback;
+    if(const auto& callbacks = _p->callbacks)
+    {
+      pre_tick = callbacks->pre_tick;
+      post_tick = callbacks->post_tick;
+      monitor_tick = callbacks->tick_monitor;
+    }
   }
+
+  const bool has_condition_scripts = static_cast<bool>(_p->scripts);
 
   // a pre-condition may return the new status.
   // In this case it override the actual tick()
-  if(auto precond = checkPreConditions())
+  std::optional<NodeStatus> precond_status;
+  if(has_condition_scripts)
   {
-    new_status = precond.value();
+    if(auto precond = checkPreConditions())
+    {
+      precond_status = precond.value();
+    }
+  }
+  if(precond_status)
+  {
+    new_status = *precond_status;
   }
   else
   {
@@ -173,7 +406,7 @@ NodeStatus TreeNode::executeTick()
   }
 
   // injected post callback
-  if(isStatusCompleted(new_status))
+  if(has_condition_scripts && isStatusCompleted(new_status))
   {
     checkPostConditions(new_status);
   }
@@ -199,7 +432,11 @@ void TreeNode::haltNode()
 {
   halt();
 
-  const auto& parse_executor = _p->post_parsed[size_t(PostCond::ON_HALTED)];
+  if(!_p->scripts)
+  {
+    return;
+  }
+  const auto& parse_executor = _p->scripts->post[size_t(PostCond::ON_HALTED)];
   if(parse_executor)
   {
     Ast::Environment env = { config().blackboard, config().enums };
@@ -232,16 +469,20 @@ void TreeNode::setStatus(NodeStatus new_status)
 
 TreeNode::PreScripts& TreeNode::preConditionsScripts()
 {
-  return _p->pre_parsed;
+  return _p->conditionScripts().pre;
 }
 
 TreeNode::PostScripts& TreeNode::postConditionsScripts()
 {
-  return _p->post_parsed;
+  return _p->conditionScripts().post;
 }
 
 Expected<NodeStatus> TreeNode::checkPreConditions()
 {
+  if(!_p->scripts)
+  {
+    return nonstd::make_unexpected("");  // no precondition
+  }
   // Built only when a script exists: copying its shared_ptrs is not free.
   std::optional<Ast::Environment> env_storage;
   auto env = [&]() -> Ast::Environment& {
@@ -257,7 +498,7 @@ Expected<NodeStatus> TreeNode::checkPreConditions()
   // node is IDLE or SKIPPED. They are NOT re-evaluated while the node is RUNNING.
   for(size_t index = 0; index < size_t(PreCond::COUNT_); index++)
   {
-    const auto& parse_executor = _p->pre_parsed[index];
+    const auto& parse_executor = _p->scripts->pre[index];
     if(!parse_executor)
     {
       continue;
@@ -307,8 +548,12 @@ Expected<NodeStatus> TreeNode::checkPreConditions()
 
 void TreeNode::checkPostConditions(NodeStatus status)
 {
+  if(!_p->scripts)
+  {
+    return;
+  }
   auto ExecuteScript = [this](const PostCond& cond) {
-    const auto& parse_executor = _p->post_parsed[size_t(cond)];
+    const auto& parse_executor = _p->scripts->post[size_t(cond)];
     if(parse_executor)
     {
       Ast::Environment env = { config().blackboard, config().enums };
@@ -354,10 +599,14 @@ NodeStatus TreeNode::waitValidStatus()
 {
   std::unique_lock<std::mutex> lock(_p->state_mutex);
 
+  if(!_p->state_condition_variable)
+  {
+    _p->state_condition_variable = std::make_unique<std::condition_variable>();
+  }
   _p->status_waiters++;
   while(isHalted())
   {
-    _p->state_condition_variable.wait(lock);
+    _p->state_condition_variable->wait(lock);
   }
   _p->status_waiters--;
   return _p->status;
@@ -382,21 +631,21 @@ TreeNode::subscribeToStatusChange(TreeNode::StatusChangeCallback callback)
 void TreeNode::setPreTickFunction(PreTickCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
-  _p->pre_tick_callback = std::move(callback);
+  _p->injectedCallbacks().pre_tick = std::move(callback);
   _p->updateInjectedCallbacksFlag();
 }
 
 void TreeNode::setPostTickFunction(PostTickCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
-  _p->post_tick_callback = std::move(callback);
+  _p->injectedCallbacks().post_tick = std::move(callback);
   _p->updateInjectedCallbacksFlag();
 }
 
 void TreeNode::setTickMonitorCallback(TickMonitorCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
-  _p->tick_monitor_callback = std::move(callback);
+  _p->injectedCallbacks().tick_monitor = std::move(callback);
   _p->updateInjectedCallbacksFlag();
 }
 

@@ -475,17 +475,27 @@ StringView TreeNode::stripBlackboardPointer(StringView str)
   return {};
 }
 
+std::optional<StringView> TreeNode::blackboardKeyOf(StringView port_name,
+                                                    StringView port_value)
+{
+  if(port_value == "{=}" || port_value == "=")
+  {
+    return port_name;
+  }
+  StringView stripped;
+  if(isBlackboardPointer(port_value, &stripped))
+  {
+    return stripped;
+  }
+  return std::nullopt;
+}
+
 Expected<StringView> TreeNode::getRemappedKey(StringView port_name,
                                               StringView remapped_port)
 {
-  if(remapped_port == "{=}" || remapped_port == "=")
+  if(auto key = blackboardKeyOf(port_name, remapped_port))
   {
-    return { port_name };
-  }
-  StringView stripped;
-  if(isBlackboardPointer(remapped_port, &stripped))
-  {
-    return { stripped };
+    return *key;
   }
   return nonstd::make_unexpected("Not a blackboard pointer");
 }

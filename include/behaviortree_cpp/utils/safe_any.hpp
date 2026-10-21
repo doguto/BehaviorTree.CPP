@@ -399,7 +399,8 @@ inline nonstd::expected<DST, std::string> Any::convert(EnableString<DST>) const
 
   if(type == typeid(SafeAny::SimpleString))
   {
-    return linb::any_cast<SafeAny::SimpleString>(_any).toStdString();
+    // cast to a reference: avoids a temporary copy of the SimpleString
+    return linb::any_cast<const SafeAny::SimpleString&>(_any).toStdString();
   }
   else if(type == typeid(int64_t))
   {
@@ -423,7 +424,7 @@ inline nonstd::expected<T, std::string> Any::stringToNumber() const
   static_assert(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>, "Expecting a "
                                                                      "numeric type");
 
-  const auto str = linb::any_cast<SafeAny::SimpleString>(_any);
+  const auto& str = linb::any_cast<const SafeAny::SimpleString&>(_any);
 #if __cpp_lib_to_chars >= 201611L
   T out;
   auto [ptr, err] = std::from_chars(str.data(), str.data() + str.size(), out);

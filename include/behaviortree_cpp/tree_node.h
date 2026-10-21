@@ -23,6 +23,7 @@
 #include <charconv>
 #include <exception>
 #include <map>
+#include <optional>
 #include <utility>
 
 #ifdef _MSC_VER
@@ -370,6 +371,14 @@ public:
   [[nodiscard]] static Expected<StringView> getRemappedKey(StringView port_name,
                                                            StringView remapped_port);
 
+  /**
+   * @brief The blackboard key that the value of a port points to: "{key}" ->
+   * "key"; "{=}" or "=" -> port_name; nothing if the value is a literal.
+   * Same as getRemappedKey(), without building an error message for literals.
+   */
+  [[nodiscard]] static std::optional<StringView> blackboardKeyOf(StringView port_name,
+                                                                 StringView port_value);
+
   /// Notify that the tree should be ticked again()
   void emitWakeUpSignal();
 
@@ -449,6 +458,24 @@ private:
 
 //-------------------------------------------------------
 
+namespace details
+{
+// Pointer to the value stored in `any` if its internal type is exactly T, or nullptr.
+// Any::castPtr<float> is not allowed (floats are stored as double).
+template <typename T>
+inline const T* directPtr(Any& any)
+{
+  if constexpr(std::is_same_v<T, float>)
+  {
+    return nullptr;
+  }
+  else
+  {
+    return any.castPtr<T>();
+  }
+}
+}  // namespace details
+
 template <typename T>
 T TreeNode::parseString(const std::string& str) const
 {
@@ -481,12 +508,15 @@ template <typename T>
 inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
                                                      T& destination) const
 {
-  std::string port_value_str;
+  // Points into config().input_ports, or to default_value_str: this avoids
+  // copying the port value at every call.
+  const std::string* port_value_str = nullptr;
+  std::string default_value_str;
 
   auto input_port_it = config().input_ports.find(key);
   if(input_port_it != config().input_ports.end())
   {
-    port_value_str = input_port_it->second;
+    port_value_str = &input_port_it->second;
   }
   else if(!config().manifest)
   {
@@ -517,7 +547,8 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     }
     if(port_info.defaultValue().isString())
     {
-      port_value_str = port_info.defaultValue().cast<std::string>();
+      default_value_str = port_info.defaultValue().cast<std::string>();
+      port_value_str = &default_value_str;
     }
     else
     {
@@ -547,7 +578,8 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     return parseString<T>(str);
   };
 
-  auto blackboard_ptr = getRemappedKey(key, port_value_str);
+  // not getRemappedKey(): it builds an error string (heap allocation) for literals
+  const std::optional<StringView> blackboard_ptr = blackboardKeyOf(key, *port_value_str);
   try
   {
     // pure string, not a blackboard key
@@ -555,7 +587,7 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     {
       try
       {
-        destination = parseStringWithConverter(port_value_str);
+        destination = parseStringWithConverter(*port_value_str);
       }
       catch(std::exception& ex)
       {
@@ -589,6 +621,12 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
         {
           destination = parseStringWithConverter(any_value.cast<std::string>());
         }
+        else if(const T* direct = details::directPtr<T>(any_value))
+        {
+          // Stored with exactly this type: copy it straight into destination,
+          // skipping the intermediate Expected<T> copies of tryCast().
+          destination = *direct;
+        }
         else
         {
           auto result =
@@ -597,7 +635,7 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
           {
             throw std::runtime_error(result.error());
           }
-          destination = result.value();
+          destination = std::move(result.value());
         }
         return Timestamp{ entry->sequence_id, entry->stamp };
       }
@@ -644,7 +682,7 @@ inline Result TreeNode::setOutput(const std::string& key, const T& value)
   StringView remapped_key = remap_it->second;
   if(remapped_key == "{=}" || remapped_key == "=")
   {
-    config().blackboard->set(static_cast<std::string>(key), value);
+    config().blackboard->set(key, value);
     return {};
   }
 

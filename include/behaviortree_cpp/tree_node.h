@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <cstring>
 #include <exception>
 #include <map>
 #include <new>
@@ -153,6 +154,63 @@ inline constexpr bool hasNodeFullCtor()
 }
 
 /// Abstract base class for Behavior Tree Nodes
+namespace details
+{
+template <typename... Ts>
+struct LiteralTypeList
+{
+  // 1-based index of T in Ts, 0 if it is not one of them
+  template <typename T>
+  static constexpr uint8_t indexOf()
+  {
+    uint8_t index = 0;
+    uint8_t i = 0;
+    ((++i, index = (index == 0 && std::is_same_v<T, Ts>) ? i : index), ...);
+    return index;
+  }
+};
+
+// The literals of the ports declared with one of these types are converted when
+// the ports are resolved (they fit in PortSlot::literal_value).
+using PreconvertedLiterals =
+    LiteralTypeList<bool, double, float, int32_t, uint32_t, int64_t, uint64_t, int16_t,
+                    uint16_t, int8_t, uint8_t>;
+
+// An input port of a node, resolved once from its configuration (which can't
+// change after the node is created, see TreeNode::config()).
+struct PortSlot
+{
+  enum Kind : uint8_t
+  {
+    Literal,
+    Blackboard
+  };
+  Kind kind = Literal;
+  // Literal of a port declared as a string (or without converter): reading it as
+  // a std::string is a copy.
+  bool string_identity = false;
+  // Literal converted once to the declared type of the port, if it is one of
+  // PreconvertedLiterals: its index there (0 otherwise), and the value.
+  uint8_t literal_type = 0;
+  uint32_t name_size = 0;
+  // first 8 characters of the name, zero padded: compared before the name itself
+  uint64_t name_prefix = 0;
+  const std::string* name = nullptr;   // key in config().input_ports
+  const std::string* value = nullptr;  // value in config().input_ports
+  alignas(8) unsigned char literal_value[8] = {};
+  // Blackboard: the key of the entry, i.e. "{key}" without braces (points into
+  // the name or the value)
+  StringView blackboard_key;
+};
+
+inline uint64_t portNamePrefix(const std::string& name)
+{
+  uint64_t prefix = 0;
+  std::memcpy(&prefix, name.data(), std::min<size_t>(name.size(), sizeof(prefix)));
+  return prefix;
+}
+}  // namespace details
+
 class TreeNode
 {
 public:
@@ -428,7 +486,7 @@ public:
     else if constexpr(hasNodeNameCtor<DerivedT>())
     {
       auto node_ptr = std::make_unique<DerivedT>(name, args...);
-      node_ptr->config() = config;
+      node_ptr->mutableConfig() = config;
       return node_ptr;
     }
   }
@@ -439,7 +497,19 @@ protected:
   friend class ControlNode;
   friend class Tree;
 
-  [[nodiscard]] NodeConfig& config();
+  /**
+   * @brief The configuration can't be modified once the node is created: the
+   * ports are resolved once (literals converted, blackboard keys extracted)
+   * instead of at every getInput().
+   *
+   * Use mutableConfig() to change it anyway, before the node is ticked: the
+   * resolved ports are then discarded.
+   */
+  [[nodiscard]] const NodeConfig& config();
+
+  /// Modifiable configuration. Not thread-safe: call it only while the node
+  /// is not ticked and nothing reads its ports.
+  [[nodiscard]] NodeConfig& mutableConfig();
 
   /// Method to be implemented by the user
   virtual BT::NodeStatus tick() = 0;
@@ -481,6 +551,16 @@ private:
   std::atomic<uint8_t> tick_flags_{ 0 };
 
   void notifyStatusChange(NodeStatus prev_status, NodeStatus new_status);
+
+  // The resolved input port `key`, or nullptr if it is not in input_ports.
+  [[nodiscard]] const details::PortSlot* findPortSlot(const std::string& key) const;
+
+  // Resolve the input ports now instead of at the first getInput() (Tree, once
+  // the tree is created).
+  void resolvePorts() const;
+
+  // Point to an identical copy of the manifest (Tree).
+  void setManifest(const TreeNodeManifest* manifest);
   void updateCallbacksFlag();
 
   Expected<NodeStatus> checkPreConditions();
@@ -562,11 +642,31 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
   // copying the port value at every call.
   const std::string* port_value_str = nullptr;
   std::string default_value_str;
+  // Set when the port is in input_ports: resolved when the node was created.
+  const details::PortSlot* slot = findPortSlot(key);
 
-  auto input_port_it = config().input_ports.find(key);
-  if(input_port_it != config().input_ports.end())
+  if(slot != nullptr)
   {
-    port_value_str = &input_port_it->second;
+    if(slot->kind == details::PortSlot::Literal)
+    {
+      if constexpr(details::PreconvertedLiterals::indexOf<T>() != 0)
+      {
+        if(slot->literal_type == details::PreconvertedLiterals::indexOf<T>())
+        {
+          std::memcpy(&destination, slot->literal_value, sizeof(T));
+          return Timestamp{};
+        }
+      }
+      if constexpr(std::is_same_v<T, std::string>)
+      {
+        if(slot->string_identity)
+        {
+          destination = *slot->value;
+          return Timestamp{};
+        }
+      }
+    }
+    port_value_str = slot->value;
   }
   else if(!config().manifest)
   {
@@ -628,8 +728,21 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     return parseString<T>(str);
   };
 
-  // not getRemappedKey(): it builds an error string (heap allocation) for literals
-  const std::optional<StringView> blackboard_ptr = blackboardKeyOf(key, *port_value_str);
+  // The blackboard key: resolved when the node was created if the port is in
+  // input_ports, otherwise found now (not with getRemappedKey(): it builds an
+  // error string, a heap allocation, for literals).
+  std::optional<StringView> blackboard_ptr;
+  if(slot != nullptr)
+  {
+    if(slot->kind == details::PortSlot::Blackboard)
+    {
+      blackboard_ptr = slot->blackboard_key;
+    }
+  }
+  else
+  {
+    blackboard_ptr = blackboardKeyOf(key, *port_value_str);
+  }
   try
   {
     // pure string, not a blackboard key

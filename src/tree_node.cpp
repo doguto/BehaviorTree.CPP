@@ -47,8 +47,9 @@ enum TickFlags : uint8_t
 // allocations, and a tick then misses the cache on every node.
 //
 // Memory comes in chunks of kChunkSize bytes. Each thread fills its own current
-// chunk with 64-byte aligned slots. The last 8 bytes of a slot point back to
-// the chunk, found with the (sized) delete. A chunk is freed when its last
+// chunk with slots aligned on kAlign (64) bytes, or on a smaller alignment for
+// small objects. The last 8 bytes of a slot point back to the chunk, found with
+// the size (and alignment) given to deallocate(). A chunk is freed when its last
 // object is destroyed (by any thread) and no thread is filling it anymore.
 // The space of destroyed objects is not reused before that: fine for nodes,
 // which live as long as their tree.
@@ -58,29 +59,30 @@ public:
   static constexpr size_t kChunkSize = 64 * 1024;
   static constexpr size_t kAlign = 64;
 
-  static void* allocate(size_t size)
+  // `align`: a power of 2, at least 8 and at most kAlign
+  static void* allocate(size_t size, size_t align = kAlign)
   {
-    const size_t slot = slotSize(size);
+    const size_t slot = slotSize(size, align);
     Chunk*& current = threadChunk().chunk;
-    if(current == nullptr || current->next + slot > current->end)
+    if(current == nullptr || alignUp(current->next, align) + slot > current->end)
     {
       Chunk* fresh = newChunk(slot);
       release(current);  // this thread does not fill it anymore
       current = fresh;
     }
-    char* ptr = current->next;
-    current->next += slot;
-    backPointer(ptr, size) = current;
+    char* ptr = alignUp(current->next, align);
+    current->next = ptr + slot;
+    backPointer(ptr, size, align) = current;
     current->refs.fetch_add(1, std::memory_order_relaxed);
     return ptr;
   }
 
-  // `size` must be the one given to allocate()
-  static void deallocate(void* ptr, size_t size) noexcept
+  // `size` and `align` must be the ones given to allocate()
+  static void deallocate(void* ptr, size_t size, size_t align = kAlign) noexcept
   {
     if(ptr != nullptr)
     {
-      release(backPointer(static_cast<char*>(ptr), size));
+      release(backPointer(static_cast<char*>(ptr), size, align));
     }
   }
 
@@ -94,14 +96,20 @@ private:
     char* end = nullptr;
   };
 
-  static constexpr size_t slotSize(size_t size)
+  static constexpr size_t slotSize(size_t size, size_t align)
   {
-    return (size + sizeof(Chunk*) + kAlign - 1) & ~(kAlign - 1);
+    return (size + sizeof(Chunk*) + align - 1) & ~(align - 1);
   }
 
-  static Chunk*& backPointer(char* ptr, size_t size)
+  static char* alignUp(char* ptr, size_t align)
   {
-    return *reinterpret_cast<Chunk**>(ptr + slotSize(size) - sizeof(Chunk*));
+    const auto address = reinterpret_cast<std::uintptr_t>(ptr);
+    return reinterpret_cast<char*>((address + align - 1) & ~std::uintptr_t(align - 1));
+  }
+
+  static Chunk*& backPointer(char* ptr, size_t size, size_t align)
+  {
+    return *reinterpret_cast<Chunk**>(ptr + slotSize(size, align) - sizeof(Chunk*));
   }
 
   static Chunk* newChunk(size_t min_slot)
@@ -202,6 +210,64 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
 
   std::shared_ptr<WakeUpSignal> wake_up;
 
+  // The input ports, resolved from config by the first getInput() (see
+  // buildPortTable()) and discarded by mutableConfig().
+  // One arena block: the header, then the slots.
+  struct PortTable
+  {
+    size_t size = 0;
+
+    [[nodiscard]] details::PortSlot* slots()
+    {
+      return reinterpret_cast<details::PortSlot*>(this + 1);
+    }
+    [[nodiscard]] const details::PortSlot* slots() const
+    {
+      return reinterpret_cast<const details::PortSlot*>(this + 1);
+    }
+    static size_t bytes(size_t size)
+    {
+      return sizeof(PortTable) + size * sizeof(details::PortSlot);
+    }
+    // small objects: 16-byte slots instead of 64-byte ones
+    static constexpr size_t kAlign = 16;
+
+    static PortTable* create(size_t size)
+    {
+      static_assert(alignof(details::PortSlot) <= alignof(PortTable));
+      static_assert(alignof(PortTable) <= kAlign);
+      auto* table = new(NodeDataArena::allocate(bytes(size), kAlign)) PortTable;
+      table->size = size;
+      for(size_t i = 0; i < size; i++)
+      {
+        new(table->slots() + i) details::PortSlot();
+      }
+      return table;
+    }
+    // shared by the nodes without input ports
+    static PortTable* empty()
+    {
+      static PortTable no_ports;
+      return &no_ports;
+    }
+
+    static void destroy(PortTable* table) noexcept
+    {
+      if(table == nullptr || table == empty())
+      {
+        return;
+      }
+      const size_t size = table->size;
+      for(size_t i = 0; i < size; i++)
+      {
+        table->slots()[i].~PortSlot();
+      }
+      table->~PortTable();
+      NodeDataArena::deallocate(table, bytes(size), kAlign);
+    }
+  };
+  mutable std::atomic<PortTable*> port_table{ nullptr };
+
   //---------- used when a thread waits for the status ----------
   mutable std::mutex state_mutex;
 
@@ -245,6 +311,19 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
     return callbacks &&
            (callbacks->pre_tick || callbacks->post_tick || callbacks->tick_monitor);
   }
+
+  ~PImpl()
+  {
+    dropPortTable();
+  }
+
+  void dropPortTable()
+  {
+    PortTable::destroy(port_table.exchange(nullptr, std::memory_order_acq_rel));
+  }
+
+  // Thread-safe: concurrent callers may build it twice, only one is kept.
+  const PortTable* buildPortTable() const;
 
   ConditionScripts& conditionScripts()
   {
@@ -353,6 +432,119 @@ void TreeNode::updateCallbacksFlag()
 }
 
 TreeNode::~TreeNode() = default;
+
+namespace
+{
+// Convert the literal once if the port is declared with type T.
+template <typename T>
+bool preconvertLiteralAs(const PortInfo& info, const std::string& literal,
+                         details::PortSlot& slot)
+{
+  static_assert(sizeof(T) <= sizeof(slot.literal_value));
+  if(info.type() != typeid(T))
+  {
+    return false;
+  }
+  try
+  {
+    const T value = convertFromString<T>(literal);
+    std::memcpy(slot.literal_value, &value, sizeof(T));
+    slot.literal_type = details::PreconvertedLiterals::indexOf<T>();
+  }
+  catch(const std::exception&)
+  {
+    // invalid literal: getInput() reports the error, as before
+  }
+  return true;
+}
+
+// Convert the literal once if the port is declared with one of the types Ts.
+template <typename... Ts>
+void preconvertLiteral(details::LiteralTypeList<Ts...> /*types*/, const PortInfo& info,
+                       const std::string& literal, details::PortSlot& slot)
+{
+  (void)(preconvertLiteralAs<Ts>(info, literal, slot) || ...);
+}
+}  // namespace
+
+const TreeNode::PImpl::PortTable* TreeNode::PImpl::buildPortTable() const
+{
+  std::unique_ptr<PortTable, void (*)(PortTable*)> table(
+      config.input_ports.empty() ? PortTable::empty() :
+                                   PortTable::create(config.input_ports.size()),
+      &PortTable::destroy);
+  size_t i = 0;
+  for(const auto& [name, value] : config.input_ports)
+  {
+    details::PortSlot& slot = table->slots()[i++];
+    slot.name = &name;
+    slot.value = &value;
+    slot.name_size = static_cast<uint32_t>(name.size());
+    slot.name_prefix = details::portNamePrefix(name);
+
+    if(auto key = TreeNode::blackboardKeyOf(name, value))
+    {
+      slot.kind = details::PortSlot::Blackboard;
+      slot.blackboard_key = *key;
+      continue;
+    }
+    const PortInfo* info = nullptr;
+    if(config.manifest)
+    {
+      auto it = config.manifest->ports.find(name);
+      info = it != config.manifest->ports.end() ? &it->second : nullptr;
+    }
+    // same conditions as getInput()
+    slot.string_identity =
+        info == nullptr || !info->converter() || info->type() == typeid(std::string);
+    if(info != nullptr && info->converter())
+    {
+      preconvertLiteral(details::PreconvertedLiterals{}, *info, value, slot);
+    }
+  }
+
+  PortTable* expected = nullptr;
+  if(port_table.compare_exchange_strong(expected, table.get(), std::memory_order_acq_rel,
+                                        std::memory_order_acquire))
+  {
+    return table.release();
+  }
+  return expected;  // built by another thread meanwhile
+}
+
+void TreeNode::resolvePorts() const
+{
+  if(_p->port_table.load(std::memory_order_acquire) == nullptr)
+  {
+    (void)_p->buildPortTable();
+  }
+}
+
+void TreeNode::setManifest(const TreeNodeManifest* manifest)
+{
+  // same declarations: the resolved ports stay valid
+  _p->config.manifest = manifest;
+}
+
+const details::PortSlot* TreeNode::findPortSlot(const std::string& key) const
+{
+  const PImpl::PortTable* table = _p->port_table.load(std::memory_order_acquire);
+  if(table == nullptr)
+  {
+    table = _p->buildPortTable();
+  }
+  const uint64_t prefix = details::portNamePrefix(key);
+  for(size_t i = 0; i < table->size; i++)
+  {
+    const details::PortSlot& slot = table->slots()[i];
+    if(slot.name_size == key.size() && slot.name_prefix == prefix &&
+       (key.size() <= sizeof(prefix) || *slot.name == key))
+    {
+      return &slot;
+    }
+  }
+  return nullptr;
+}
 
 NodeStatus TreeNode::executeTick()
 {
@@ -727,8 +919,14 @@ const NodeConfig& TreeNode::config() const
   return _p->config;
 }
 
-NodeConfig& TreeNode::config()
+const NodeConfig& TreeNode::config()
 {
+  return _p->config;
+}
+
+NodeConfig& TreeNode::mutableConfig()
+{
+  _p->dropPortTable();
   return _p->config;
 }
 

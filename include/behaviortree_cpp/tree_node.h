@@ -20,6 +20,7 @@
 #include "behaviortree_cpp/utils/strcat.hpp"
 #include "behaviortree_cpp/utils/wakeup_signal.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <exception>
 #include <map>
@@ -200,9 +201,15 @@ public:
 
   void haltNode();
 
-  [[nodiscard]] bool isHalted() const;
+  [[nodiscard]] bool isHalted() const
+  {
+    return status() == NodeStatus::IDLE;
+  }
 
-  [[nodiscard]] NodeStatus status() const;
+  [[nodiscard]] NodeStatus status() const
+  {
+    return status_.load(std::memory_order_acquire);
+  }
 
   /// Name of the instance, not the type
   [[nodiscard]] const std::string& name() const;
@@ -466,6 +473,15 @@ protected:
 private:
   struct PImpl;
   std::unique_ptr<PImpl> _p;
+
+  // Read and written at every tick: kept in the node object, next to the vtable
+  // pointer, so that ticking or resetting a node usually touches a single
+  // cache line of it (see tree_node.cpp for the flags).
+  std::atomic<NodeStatus> status_{ NodeStatus::IDLE };
+  std::atomic<uint8_t> tick_flags_{ 0 };
+
+  void notifyStatusChange(NodeStatus prev_status, NodeStatus new_status);
+  void updateCallbacksFlag();
 
   Expected<NodeStatus> checkPreConditions();
   void checkPostConditions(NodeStatus status);

@@ -13,6 +13,7 @@
 #pragma once
 
 #include "behaviortree_cpp/decorator_node.h"
+#include "behaviortree_cpp/utils/shared_timer_queue.h"
 #include "behaviortree_cpp/utils/timer_queue.h"
 
 #include <atomic>
@@ -39,6 +40,11 @@ public:
 
   DelayNode(const std::string& name, const NodeConfig& config);
 
+  /// Uses `shared_timer`, when not null, instead of starting its own timer
+  /// thread (see BehaviorTreeFactory::useSharedTimerThread()).
+  DelayNode(const std::string& name, const NodeConfig& config,
+            std::shared_ptr<SharedTimerQueue> shared_timer);
+
   ~DelayNode() override
   {
     halt();
@@ -58,7 +64,9 @@ public:
   void halt() override;
 
 private:
-  TimerQueue<> timer_;
+  // Its own timer thread (default), or the shared one
+  std::unique_ptr<TimerQueue<>> timer_;
+  std::shared_ptr<SharedTimerQueue> shared_timer_;
   uint64_t timer_id_;
 
   virtual BT::NodeStatus tick() override;

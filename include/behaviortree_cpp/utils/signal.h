@@ -34,6 +34,12 @@ public:
     }
   }
 
+  /// True if nobody subscribed. Expired subscribers count until the next notify().
+  [[nodiscard]] bool empty() const
+  {
+    return subscribers_.empty();
+  }
+
   Subscriber subscribe(CallableFunction func)
   {
     Subscriber sub = std::make_shared<CallableFunction>(std::move(func));

@@ -204,6 +204,10 @@ private:
   friend class BehaviorTreeFactory;
 
   std::shared_ptr<WakeUpSignal> wake_up_;
+  // Root node, cached by initialize(): finding it in subtrees at every tick
+  // means following 4 pointers (cache misses when the tree is not in cache).
+  // Shared ownership, so that it can't dangle if subtrees is modified.
+  TreeNode::Ptr root_;
 
   enum TickOption
   {
@@ -245,6 +249,18 @@ public:
 
   /// Remove a registered ID.
   bool unregisterBuilder(const std::string& ID);
+
+  /**
+   * @brief The Delay and Sleep nodes created afterwards by this factory share a
+   * single timer thread, instead of starting one thread each (default: false).
+   *
+   * Useful with many of these nodes. The shared thread is started when the
+   * first node using it is created, so it inherits the scheduling policy,
+   * priority and CPU affinity of the thread creating that tree, and it stops
+   * when the last one is destroyed. Timeout nodes keep their own thread: they
+   * halt their child from it, which may take long.
+   */
+  void useSharedTimerThread(bool enable = true);
 
   /** The most generic way to register a NodeBuilder.
     *

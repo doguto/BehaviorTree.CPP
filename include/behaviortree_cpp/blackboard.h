@@ -76,7 +76,14 @@ public:
     return std::shared_ptr<Blackboard>(new Blackboard(parent));
   }
 
-  virtual ~Blackboard() = default;
+  virtual ~Blackboard();
+
+  /**
+   * @brief Changed by every change of the structure of any blackboard: entry
+   * added or removed, remapping changed, blackboard destroyed. As long as it
+   * doesn't change, getEntry(key) returns the same entry: it can be cached.
+   */
+  [[nodiscard]] static uint64_t structureVersion() noexcept;
 
   void enableAutoRemapping(bool remapping);
 
@@ -184,6 +191,32 @@ private:
 
   std::shared_ptr<Entry> createEntryImpl(const std::string& key, const TypeInfo& info);
 
+  static void structureChanged() noexcept;
+
+  // The two ways set() writes an existing entry (also used by
+  // TreeNode::setOutput() with the entry of the port, found only once):
+  // - an entry of a parent blackboard, through remapping. Returns false if
+  //   the type doesn't match: set() then reports the error.
+  template <typename T>
+  bool writeRemappedEntry(Entry& entry, const T& value);
+  // - an entry of this blackboard: checks or converts the type.
+  template <typename T>
+  void writeExistingEntry(const std::string& key, Entry& entry, const T& value);
+
+  // The entry of this blackboard (not of a parent), or nullptr.
+  [[nodiscard]] std::shared_ptr<Entry> findLocalEntry(const std::string& key) const
+  {
+    const std::shared_lock storage_lock(storage_mutex_);
+    auto it = storage_.find(key);
+    return it != storage_.end() ? it->second : nullptr;
+  }
+
+  friend class TreeNode;
+
+  // The existing entry that createEntryImpl(key) would return from a parent
+  // blackboard (through remapping), or nullptr. Read-only: shared locks only.
+  [[nodiscard]] std::shared_ptr<Entry> findRemappedEntry(const std::string& key) const;
+
   bool autoremapping_ = false;
 
   // Optional registry for polymorphic shared_ptr conversions
@@ -213,7 +246,7 @@ inline Expected<T> Blackboard::tryCastWithPolymorphicFallback(const Any* any) co
   auto result = any->tryCast<T>();
   if(result)
   {
-    return result.value();
+    return std::move(result.value());
   }
 
   // For shared_ptr types, try polymorphic cast via registry (Issue #943)
@@ -243,6 +276,15 @@ inline T Blackboard::get(const std::string& key) const
       throw RuntimeError("Blackboard::get() error. Entry [", key,
                          "] hasn't been initialized, yet");
     }
+    if constexpr(!std::is_same_v<T, float>)
+    {
+      // Stored with exactly this type: copy it directly, without the
+      // intermediate copies of tryCast()
+      if(const T* direct = any_ref->template castPtr<T>())
+      {
+        return *direct;
+      }
+    }
     auto result = tryCastWithPolymorphicFallback<T>(any);
     if(!result)
     {
@@ -266,6 +308,7 @@ inline void Blackboard::unset(const std::string& key)
   }
 
   storage_.erase(it);
+  structureChanged();
 }
 
 template <typename T>
@@ -282,9 +325,19 @@ inline void Blackboard::set(const std::string& key, const T& value)
   auto it = storage_.find(key);
   if(it == storage_.end())
   {
+    storage_lock.unlock();
+    // Usually the entry exists in a parent blackboard (remapping): write it
+    // directly, as createEntryImpl() below would return it, unless the type
+    // differs (let createEntryImpl() report the error).
+    if(auto entry = findRemappedEntry(key))
+    {
+      if(writeRemappedEntry(*entry, value))
+      {
+        return;
+      }
+    }
     // create a new entry
     Any new_value(value);
-    storage_lock.unlock();
     std::shared_ptr<Blackboard::Entry> entry;
     // if a new generic port is created with a string, it's type should be AnyTypeAllowed
     if constexpr(std::is_same_v<std::string, T>)
@@ -313,76 +366,107 @@ inline void Blackboard::set(const std::string& key, const T& value)
     // calls unset() while we hold the reference (BUG-2 fix).
     auto entry_ptr = it->second;
     storage_lock.unlock();
-    Entry& entry = *entry_ptr;
+    writeExistingEntry(key, *entry_ptr, value);
+  }
+}
 
-    std::scoped_lock scoped_lock(entry.entry_mutex);
+template <typename T>
+inline bool Blackboard::writeRemappedEntry(Entry& entry, const T& value)
+{
+  Any new_value(value);
+  bool new_strongly_typed = false;
+  if constexpr(!std::is_same_v<std::string, T>)
+  {
+    new_strongly_typed =
+        new_value.type() != typeid(AnyTypeAllowed) && new_value.type() != typeid(BT::Any);
+  }
+  std::scoped_lock entry_lock(entry.entry_mutex);
+  if(!new_strongly_typed || !entry.info.isStronglyTyped() ||
+     entry.info.type() == new_value.type())
+  {
+    entry.value = std::move(new_value);
+    entry.sequence_id++;
+    entry.stamp = std::chrono::steady_clock::now().time_since_epoch();
+    return true;
+  }
+  return false;
+}
 
-    Any& previous_any = entry.value;
-    Any new_value(value);
+template <typename T>
+inline void Blackboard::writeExistingEntry(const std::string& key, Entry& entry,
+                                           const T& value)
+{
+  std::scoped_lock scoped_lock(entry.entry_mutex);
 
-    // special case: entry exists but it is not strongly typed... yet
-    if(!entry.info.isStronglyTyped())
+  Any& previous_any = entry.value;
+  Any new_value(value);
+
+  // special case: entry exists but it is not strongly typed... yet
+  if(!entry.info.isStronglyTyped())
+  {
+    // Use the new type to create a new entry that is strongly typed.
+    // (set<Any> keeps it untyped: don't build the same TypeInfo again)
+    if(!std::is_same_v<T, Any> || entry.info.type() != typeid(Any))
     {
-      // Use the new type to create a new entry that is strongly typed.
       entry.info = TypeInfo::Create<T>();
-      entry.sequence_id++;
-      entry.stamp = std::chrono::steady_clock::now().time_since_epoch();
-      previous_any = std::move(new_value);
-      return;
-    }
-
-    std::type_index previous_type = entry.info.type();
-
-    // check type mismatch
-    if(previous_type != std::type_index(typeid(T)) && previous_type != new_value.type())
-    {
-      bool mismatching = true;
-      if(std::is_constructible<StringView, T>::value)
-      {
-        Any any_from_string = entry.info.parseString(value);
-        if(any_from_string.empty() == false)
-        {
-          mismatching = false;
-          new_value = std::move(any_from_string);
-        }
-      }
-      // check if we are doing a safe cast between numbers
-      // for instance, it is safe to use int(100) to set
-      // a uint8_t port, but not int(-42) or int(300)
-      if constexpr(std::is_arithmetic_v<T>)
-      {
-        if(mismatching && isCastingSafe(previous_type, value))
-        {
-          mismatching = false;
-        }
-      }
-
-      if(mismatching)
-      {
-        debugMessage();
-
-        auto msg = StrCat("Blackboard::set(", key,
-                          "): once declared, "
-                          "the type of a port shall not change. "
-                          "Previously declared type [",
-                          BT::demangle(previous_type), "], current type [",
-                          BT::demangle(typeid(T)), "]");
-        throw LogicError(msg);
-      }
-    }
-    // if doing set<BT::Any>, skip type check
-    if constexpr(std::is_same_v<Any, T>)
-    {
-      previous_any = new_value;
-    }
-    else
-    {
-      // copy only if the type is compatible
-      new_value.copyInto(previous_any);
     }
     entry.sequence_id++;
     entry.stamp = std::chrono::steady_clock::now().time_since_epoch();
+    previous_any = std::move(new_value);
+    return;
   }
+
+  std::type_index previous_type = entry.info.type();
+
+  // check type mismatch
+  if(previous_type != std::type_index(typeid(T)) && previous_type != new_value.type())
+  {
+    bool mismatching = true;
+    if(std::is_constructible<StringView, T>::value)
+    {
+      Any any_from_string = entry.info.parseString(value);
+      if(any_from_string.empty() == false)
+      {
+        mismatching = false;
+        new_value = std::move(any_from_string);
+      }
+    }
+    // check if we are doing a safe cast between numbers
+    // for instance, it is safe to use int(100) to set
+    // a uint8_t port, but not int(-42) or int(300)
+    if constexpr(std::is_arithmetic_v<T>)
+    {
+      if(mismatching && isCastingSafe(previous_type, value))
+      {
+        mismatching = false;
+      }
+    }
+
+    if(mismatching)
+    {
+      debugMessage();
+
+      auto msg = StrCat("Blackboard::set(", key,
+                        "): once declared, "
+                        "the type of a port shall not change. "
+                        "Previously declared type [",
+                        BT::demangle(previous_type), "], current type [",
+                        BT::demangle(typeid(T)), "]");
+      throw LogicError(msg);
+    }
+  }
+  // if doing set<BT::Any>, skip type check
+  if constexpr(std::is_same_v<Any, T>)
+  {
+    previous_any = new_value;
+  }
+  else
+  {
+    // copy only if the type is compatible
+    new_value.copyInto(previous_any);
+  }
+  entry.sequence_id++;
+  entry.stamp = std::chrono::steady_clock::now().time_since_epoch();
 }
 
 template <typename T>
@@ -394,6 +478,16 @@ inline bool Blackboard::get(const std::string& key, T& value) const
     if(any->empty())
     {
       return false;
+    }
+    if constexpr(!std::is_same_v<T, float>)
+    {
+      // Stored with exactly this type: copy it directly, without the
+      // intermediate copies of tryCast()
+      if(const T* direct = any_ref->template castPtr<T>())
+      {
+        value = *direct;
+        return true;
+      }
     }
     auto result = tryCastWithPolymorphicFallback<T>(any);
     if(!result)

@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD 17)
 option(BTCPP_SHARED_LIBS "Build shared libraries" ON)
 option(BTCPP_BUILD_TOOLS "Build commandline tools" ON)
 option(BTCPP_EXAMPLES   "Build tutorials and examples" ON)
+option(BTCPP_BUILD_BENCHMARKS "Build the performance/memory benchmarks" OFF)
 option(BUILD_TESTING "Build the unit tests" ON)
 option(BTCPP_GROOT_INTERFACE "Add Groot2 connection. Requires ZeroMQ" ON)
 option(BTCPP_SQLITE_LOGGING "Add SQLite logging." ON)
@@ -268,6 +269,19 @@ else()
     endif()
 endif()
 
+# Calls between functions of the shared library are bound when it is linked,
+# instead of going through the PLT at every call (one more indirect jump and
+# one more cache line to load, at every tick of every node).
+if(BTCPP_SHARED_LIBS AND NOT APPLE AND NOT WIN32 AND
+   CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-fno-semantic-interposition BTCPP_HAS_NO_SEMANTIC_INTERPOSITION)
+    if(BTCPP_HAS_NO_SEMANTIC_INTERPOSITION)
+        target_compile_options(${BTCPP_LIBRARY} PRIVATE -fno-semantic-interposition)
+    endif()
+    target_link_options(${BTCPP_LIBRARY} PRIVATE "LINKER:-Bsymbolic-functions")
+endif()
+
 add_library(BT::${BTCPP_LIBRARY} ALIAS ${BTCPP_LIBRARY})
 
 # Add fuzzing targets
@@ -297,6 +311,10 @@ endif()
 
 if(BTCPP_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(BTCPP_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
 
 ######################################################

@@ -2,6 +2,7 @@
 
 #include "behaviortree_cpp/json_export.h"
 
+#include <atomic>
 #include <tuple>
 #include <unordered_set>
 
@@ -16,9 +17,31 @@ bool IsPrivateKey(StringView str)
 }
 }  // namespace
 
+namespace
+{
+// 0 is never a valid version (see structureVersion())
+std::atomic<uint64_t> g_structure_version{ 1 };
+}  // namespace
+
+uint64_t Blackboard::structureVersion() noexcept
+{
+  return g_structure_version.load(std::memory_order_acquire);
+}
+
+void Blackboard::structureChanged() noexcept
+{
+  g_structure_version.fetch_add(1, std::memory_order_acq_rel);
+}
+
+Blackboard::~Blackboard()
+{
+  structureChanged();
+}
+
 void Blackboard::enableAutoRemapping(bool remapping)
 {
   autoremapping_ = remapping;
+  structureChanged();
 }
 
 AnyPtrLocked Blackboard::getAnyLocked(const std::string& key)
@@ -99,6 +122,7 @@ void Blackboard::addSubtreeRemapping(StringView internal, StringView external)
 {
   internal_to_external_.insert(
       { static_cast<std::string>(internal), static_cast<std::string>(external) });
+  structureChanged();
 }
 
 void Blackboard::debugMessage() const
@@ -159,6 +183,7 @@ void Blackboard::clear()
 {
   const std::unique_lock storage_lock(storage_mutex_);
   storage_.clear();
+  structureChanged();
 }
 
 void Blackboard::createEntry(const std::string& key, const TypeInfo& info)
@@ -267,6 +292,7 @@ void Blackboard::cloneInto(Blackboard& dst) const
     {
       dst.storage_.erase(key);
     }
+    structureChanged();
   }
 }
 
@@ -275,6 +301,33 @@ Blackboard::Ptr Blackboard::parent()
   if(auto parent = parent_bb_.lock())
   {
     return parent;
+  }
+  return {};
+}
+
+std::shared_ptr<Blackboard::Entry>
+Blackboard::findRemappedEntry(const std::string& key) const
+{
+  // same lookup order as createEntryImpl()
+  {
+    const std::shared_lock storage_lock(storage_mutex_);
+    if(auto it = storage_.find(key); it != storage_.end())
+    {
+      return it->second;
+    }
+  }
+  auto parent = parent_bb_.lock();
+  if(!parent)
+  {
+    return {};
+  }
+  if(auto it = internal_to_external_.find(key); it != internal_to_external_.end())
+  {
+    return parent->findRemappedEntry(it->second);
+  }
+  if(autoremapping_ && !IsPrivateKey(key))
+  {
+    return parent->findRemappedEntry(key);
   }
   return {};
 }
@@ -331,6 +384,7 @@ std::shared_ptr<Blackboard::Entry> Blackboard::createEntryImpl(const std::string
   // even if empty, let's assign to it a default type
   entry->value = Any(info.type());
   storage_.insert({ key, entry });
+  structureChanged();
   return entry;
 }
 

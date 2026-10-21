@@ -16,6 +16,12 @@ public:
   /// signal was received.
   bool waitFor(std::chrono::microseconds usec)
   {
+    if(usec.count() <= 0)
+    {
+      // Nothing to wait for (Tree::tickOnce() checks the signal after every
+      // tick): consume the signal without locking and without a system call.
+      return ready_.exchange(false);
+    }
     std::unique_lock<std::mutex> lk(mutex_);
     auto res = cv_.wait_for(lk, usec, [this] { return ready_.load(); });
     ready_ = false;

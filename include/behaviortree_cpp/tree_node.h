@@ -20,9 +20,14 @@
 #include "behaviortree_cpp/utils/strcat.hpp"
 #include "behaviortree_cpp/utils/wakeup_signal.hpp"
 
+#include <atomic>
 #include <charconv>
+#include <cstring>
 #include <exception>
 #include <map>
+#include <new>
+#include <optional>
+#include <thread>
 #include <utility>
 
 #ifdef _MSC_VER
@@ -150,6 +155,76 @@ inline constexpr bool hasNodeFullCtor()
 }
 
 /// Abstract base class for Behavior Tree Nodes
+namespace details
+{
+// An input port of a node, resolved once from its configuration (which can't
+// change after the node is created, see TreeNode::config()).
+struct PortSlot
+{
+  enum Kind : uint8_t
+  {
+    Literal,
+    Blackboard
+  };
+  Kind kind = Literal;
+  // An output port (in output_ports), otherwise an input port
+  bool output = false;
+  // Output: setOutput<Any>() is allowed (port declared as Any)
+  bool any_output_allowed = false;
+  // Output: bound_entry is in config().blackboard itself, not in a parent
+  // (Blackboard::set() checks the type differently)
+  mutable bool bound_local = false;
+  // Literal of a port declared as a string (or without converter): reading it as
+  // a std::string is a copy.
+  bool string_identity = false;
+  uint32_t name_size = 0;
+  // first 8 characters of the name, zero padded: compared before the name itself
+  uint64_t name_prefix = 0;
+  const std::string* name = nullptr;   // key in config().input_ports
+  const std::string* value = nullptr;  // value in config().input_ports
+  // Literal converted once to the declared type of the port, when it is a
+  // number or a bool (nullptr otherwise).
+  const std::type_info* literal_type = nullptr;
+  alignas(8) unsigned char literal_value[8] = {};
+  // Blackboard: the key of the entry, i.e. "{key}" without braces
+  std::string blackboard_key;
+  // Blackboard: the entry found by the last getInput(), which getEntry() keeps
+  // returning while Blackboard::structureVersion() == bound_version (0: none).
+  // Guarded by bind_lock, held while the entry is read.
+  mutable std::atomic_flag bind_lock = ATOMIC_FLAG_INIT;
+  mutable uint64_t bound_version = 0;
+  mutable std::shared_ptr<Blackboard::Entry> bound_entry;
+};
+
+class PortSlotLock
+{
+public:
+  explicit PortSlotLock(const PortSlot& slot) : slot_(slot)
+  {
+    while(slot_.bind_lock.test_and_set(std::memory_order_acquire))
+    {
+      std::this_thread::yield();
+    }
+  }
+  ~PortSlotLock()
+  {
+    slot_.bind_lock.clear(std::memory_order_release);
+  }
+  PortSlotLock(const PortSlotLock&) = delete;
+  PortSlotLock& operator=(const PortSlotLock&) = delete;
+
+private:
+  const PortSlot& slot_;
+};
+
+inline uint64_t portNamePrefix(const std::string& name)
+{
+  uint64_t prefix = 0;
+  std::memcpy(&prefix, name.data(), std::min<size_t>(name.size(), sizeof(prefix)));
+  return prefix;
+}
+}  // namespace details
+
 class TreeNode
 {
 public:
@@ -175,14 +250,38 @@ public:
 
   virtual ~TreeNode();
 
+  // Nodes (including derived classes) are allocated next to each other and to
+  // their internal data, in creation order, to be cache friendly when ticked.
+  // A node allocated with these must be deleted through them: use `new`/`delete`
+  // or std::unique_ptr, as usual.
+  static void* operator new(std::size_t size);
+  static void* operator new(std::size_t size, std::align_val_t align);
+  static void operator delete(void* ptr, std::size_t size) noexcept;
+  static void operator delete(void* ptr, std::size_t size,
+                              std::align_val_t align) noexcept;
+  // the other usual forms
+  static void* operator new(std::size_t size, const std::nothrow_t&) noexcept;
+  static void* operator new(std::size_t, void* where) noexcept
+  {
+    return where;
+  }
+  static void operator delete(void*, void*) noexcept
+  {}
+
   /// The method that should be used to invoke tick() and setStatus();
   virtual BT::NodeStatus executeTick();
 
   void haltNode();
 
-  [[nodiscard]] bool isHalted() const;
+  [[nodiscard]] bool isHalted() const
+  {
+    return status() == NodeStatus::IDLE;
+  }
 
-  [[nodiscard]] NodeStatus status() const;
+  [[nodiscard]] NodeStatus status() const
+  {
+    return status_.load(std::memory_order_acquire);
+  }
 
   /// Name of the instance, not the type
   [[nodiscard]] const std::string& name() const;
@@ -393,7 +492,7 @@ public:
     else if constexpr(hasNodeNameCtor<DerivedT>())
     {
       auto node_ptr = std::make_unique<DerivedT>(name, args...);
-      node_ptr->config() = config;
+      node_ptr->mutableConfig() = config;
       return node_ptr;
     }
   }
@@ -404,7 +503,19 @@ protected:
   friend class ControlNode;
   friend class Tree;
 
-  [[nodiscard]] NodeConfig& config();
+  /**
+   * @brief The configuration can't be modified once the node is created: the
+   * ports are resolved once (literals converted, blackboard keys extracted)
+   * instead of at every getInput().
+   *
+   * Use mutableConfig() to change it anyway, before the node is ticked: the
+   * resolved ports are then discarded.
+   */
+  [[nodiscard]] const NodeConfig& config();
+
+  /// Modifiable configuration. Not thread-safe: call it only while the node
+  /// is not ticked and nothing reads its ports.
+  [[nodiscard]] NodeConfig& mutableConfig();
 
   /// Method to be implemented by the user
   virtual BT::NodeStatus tick() = 0;
@@ -439,6 +550,33 @@ private:
   struct PImpl;
   std::unique_ptr<PImpl> _p;
 
+  // Read and written at every tick: kept in the node object, next to the vtable
+  // pointer, so that ticking or resetting a node usually touches a single
+  // cache line of it (see tree_node.cpp for the flags).
+  std::atomic<NodeStatus> status_{ NodeStatus::IDLE };
+  std::atomic<uint8_t> tick_flags_{ 0 };
+
+  void notifyStatusChange(NodeStatus prev_status, NodeStatus new_status);
+
+  // The resolved input (or output) port `key`, or nullptr if it is not in
+  // input_ports (output_ports).
+  [[nodiscard]] const details::PortSlot* findPortSlot(const std::string& key,
+                                                      bool output = false) const;
+
+  // The entry of a blackboard port, found again only when the structure of the
+  // blackboards changed. Call while holding a PortSlotLock.
+  [[nodiscard]] Blackboard::Entry* boundEntry(const details::PortSlot& slot) const;
+  // Same for an output port: the entry that Blackboard::set() would write.
+  [[nodiscard]] Blackboard::Entry* boundOutputEntry(const details::PortSlot& slot) const;
+
+  // Resolve the input ports now instead of at the first getInput() (Tree, once
+  // the tree is created).
+  void resolvePorts() const;
+
+  // Point to an identical copy of the manifest (Tree).
+  void setManifest(const TreeNodeManifest* manifest);
+  void updateCallbacksFlag();
+
   Expected<NodeStatus> checkPreConditions();
   void checkPostConditions(NodeStatus status);
 
@@ -448,6 +586,43 @@ private:
 };
 
 //-------------------------------------------------------
+
+namespace details
+{
+// True if the input port `key` is set (in the XML) to a literal equal to `value`,
+// i.e. getInput<std::string>(key) would return `value`. Nodes use it to check
+// that a script didn't change without copying it at every tick.
+inline bool literalPortEquals(const NodeConfig& config, const std::string& key,
+                              const std::string& value)
+{
+  auto it = config.input_ports.find(key);
+  if(it == config.input_ports.end())
+  {
+    return false;
+  }
+  const std::string& raw = it->second;
+  if(raw == "=" || TreeNode::isBlackboardPointer(raw))
+  {
+    return false;
+  }
+  return raw == value;
+}
+
+// Pointer to the value stored in `any` if its internal type is exactly T, or nullptr.
+// Any::castPtr<float> is not allowed (floats are stored as double).
+template <typename T>
+inline const T* directPtr(Any& any)
+{
+  if constexpr(std::is_same_v<T, float>)
+  {
+    return nullptr;
+  }
+  else
+  {
+    return any.castPtr<T>();
+  }
+}
+}  // namespace details
 
 template <typename T>
 T TreeNode::parseString(const std::string& str) const
@@ -481,12 +656,35 @@ template <typename T>
 inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
                                                      T& destination) const
 {
-  std::string port_value_str;
+  // Points into config().input_ports, or to default_value_str: this avoids
+  // copying the port value at every call.
+  const std::string* port_value_str = nullptr;
+  std::string default_value_str;
+  // Set when the port is in input_ports: resolved when the node was created.
+  const details::PortSlot* slot = findPortSlot(key);
 
-  auto input_port_it = config().input_ports.find(key);
-  if(input_port_it != config().input_ports.end())
+  if(slot != nullptr)
   {
-    port_value_str = input_port_it->second;
+    if(slot->kind == details::PortSlot::Literal)
+    {
+      if constexpr(std::is_arithmetic_v<T>)
+      {
+        if(slot->literal_type == &typeid(T))
+        {
+          std::memcpy(&destination, slot->literal_value, sizeof(T));
+          return Timestamp{};
+        }
+      }
+      if constexpr(std::is_same_v<T, std::string>)
+      {
+        if(slot->string_identity)
+        {
+          destination = *slot->value;
+          return Timestamp{};
+        }
+      }
+    }
+    port_value_str = slot->value;
   }
   else if(!config().manifest)
   {
@@ -517,7 +715,8 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     }
     if(port_info.defaultValue().isString())
     {
-      port_value_str = port_info.defaultValue().cast<std::string>();
+      default_value_str = port_info.defaultValue().cast<std::string>();
+      port_value_str = &default_value_str;
     }
     else
     {
@@ -547,7 +746,29 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     return parseString<T>(str);
   };
 
-  auto blackboard_ptr = getRemappedKey(key, port_value_str);
+  // Same logic as getRemappedKey(), without building an error string
+  // (heap allocation) when the port does not point to the blackboard.
+  std::optional<StringView> blackboard_ptr;
+  if(slot != nullptr)
+  {
+    if(slot->kind == details::PortSlot::Blackboard)
+    {
+      blackboard_ptr = slot->blackboard_key;
+    }
+  }
+  else
+  {
+    const StringView remapped_port = *port_value_str;
+    StringView stripped;
+    if(remapped_port == "{=}" || remapped_port == "=")
+    {
+      blackboard_ptr = key;
+    }
+    else if(isBlackboardPointer(remapped_port, &stripped))
+    {
+      blackboard_ptr = stripped;
+    }
+  }
   try
   {
     // pure string, not a blackboard key
@@ -555,7 +776,39 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
     {
       try
       {
-        destination = parseStringWithConverter(port_value_str);
+        if constexpr(std::is_same_v<T, std::string>)
+        {
+          // The literal of a string port converts to itself: copy it directly,
+          // reusing the buffer of destination.
+          const PortInfo* info = nullptr;
+          if(config().manifest)
+          {
+            auto it = config().manifest->ports.find(key);
+            info = it != config().manifest->ports.end() ? &it->second : nullptr;
+          }
+          if(info == nullptr || !info->converter() || info->type() == typeid(std::string))
+          {
+            destination = *port_value_str;
+            return Timestamp{};
+          }
+        }
+        if constexpr(std::is_arithmetic_v<T>)
+        {
+          // A port declared with type T converts with convertFromString<T>:
+          // call it directly, without going through the converter and Any.
+          const PortInfo* info = nullptr;
+          if(config().manifest)
+          {
+            auto it = config().manifest->ports.find(key);
+            info = it != config().manifest->ports.end() ? &it->second : nullptr;
+          }
+          if(info == nullptr || !info->converter() || info->type() == typeid(T))
+          {
+            destination = parseString<T>(*port_value_str);
+            return Timestamp{};
+          }
+        }
+        destination = parseStringWithConverter(*port_value_str);
       }
       catch(std::exception& ex)
       {
@@ -571,7 +824,20 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
                                      "an invalid Blackboard");
     }
 
-    if(auto entry = config().blackboard->getEntry(std::string(blackboard_key)))
+    std::optional<details::PortSlotLock> slot_lock;
+    std::shared_ptr<Blackboard::Entry> entry_holder;
+    Blackboard::Entry* entry = nullptr;
+    if(slot != nullptr)
+    {
+      slot_lock.emplace(*slot);
+      entry = boundEntry(*slot);
+    }
+    else
+    {
+      entry_holder = config().blackboard->getEntry(std::string(blackboard_key));
+      entry = entry_holder.get();
+    }
+    if(entry != nullptr)
     {
       std::unique_lock lk(entry->entry_mutex);
       auto& any_value = entry->value;
@@ -589,6 +855,12 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
         {
           destination = parseStringWithConverter(any_value.cast<std::string>());
         }
+        else if(const T* direct = details::directPtr<T>(any_value))
+        {
+          // Stored with exactly this type: copy it straight into destination,
+          // skipping the intermediate Expected<T> copies of tryCast().
+          destination = *direct;
+        }
         else
         {
           auto result =
@@ -597,7 +869,7 @@ inline Expected<Timestamp> TreeNode::getInputStamped(const std::string& key,
           {
             throw std::runtime_error(result.error());
           }
-          destination = result.value();
+          destination = std::move(result.value());
         }
         return Timestamp{ entry->sequence_id, entry->stamp };
       }
@@ -633,6 +905,31 @@ inline Result TreeNode::setOutput(const std::string& key, const T& value)
                                    "Blackboard(BB) entry, but BB is invalid");
   }
 
+  // Fast path: the entry of the port was found by a previous call
+  if(const details::PortSlot* slot = findPortSlot(key, true);
+     slot != nullptr && slot->kind == details::PortSlot::Blackboard &&
+     !slot->blackboard_key.empty() && slot->blackboard_key.front() != '@' &&
+     (!std::is_same_v<T, Any> || slot->any_output_allowed))
+  {
+    const details::PortSlotLock slot_lock(*slot);
+    Blackboard& blackboard = *config().blackboard;
+    if(Blackboard::Entry* entry = boundOutputEntry(*slot))
+    {
+      if(slot->bound_local)
+      {
+        blackboard.writeExistingEntry(slot->blackboard_key, *entry, value);
+        return {};
+      }
+      if(blackboard.writeRemappedEntry(*entry, value))
+      {
+        return {};
+      }
+    }
+    // no entry yet, or type mismatch: set() creates it, or reports the error
+    blackboard.set(slot->blackboard_key, value);
+    return {};
+  }
+
   auto remap_it = config().output_ports.find(key);
   if(remap_it == config().output_ports.end())
   {
@@ -644,7 +941,7 @@ inline Result TreeNode::setOutput(const std::string& key, const T& value)
   StringView remapped_key = remap_it->second;
   if(remapped_key == "{=}" || remapped_key == "=")
   {
-    config().blackboard->set(static_cast<std::string>(key), value);
+    config().blackboard->set(key, value);
     return {};
   }
 

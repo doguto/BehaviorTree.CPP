@@ -94,6 +94,42 @@ std::string loadXmlAndResolveTreeId(Parser* parser, const std::string& main_tree
 
 }  // namespace
 
+namespace
+{
+// The timer thread shared by the Delay and Sleep nodes of a factory, when
+// enabled: created by the first node that needs it, stopped with the last one.
+class SharedTimers
+{
+public:
+  void setEnabled(bool enabled)
+  {
+    const std::scoped_lock lk(mutex_);
+    enabled_ = enabled;
+  }
+
+  std::shared_ptr<SharedTimerQueue> get()
+  {
+    const std::scoped_lock lk(mutex_);
+    if(!enabled_)
+    {
+      return nullptr;
+    }
+    auto queue = queue_.lock();
+    if(!queue)
+    {
+      queue = std::make_shared<SharedTimerQueue>();
+      queue_ = queue;
+    }
+    return queue;
+  }
+
+private:
+  std::mutex mutex_;
+  bool enabled_ = false;
+  std::weak_ptr<SharedTimerQueue> queue_;
+};
+}  // namespace
+
 bool WildcardMatch(std::string const& str, StringView filter)
 {
   return wildcards_match(str, { filter.data(), filter.size() });
@@ -109,6 +145,8 @@ struct BehaviorTreeFactory::PImpl
   std::shared_ptr<BT::Parser> parser;
   std::unordered_map<std::string, SubstitutionRule> substitution_rules;
   std::shared_ptr<PolymorphicCastRegistry> polymorphic_registry;
+  // shared with the builders of Delay and Sleep
+  std::shared_ptr<SharedTimers> shared_timers = std::make_shared<SharedTimers>();
 };
 
 BehaviorTreeFactory::BehaviorTreeFactory() : _p(new PImpl)
@@ -139,7 +177,11 @@ BehaviorTreeFactory::BehaviorTreeFactory() : _p(new PImpl)
   registerNodeType<KeepRunningUntilFailureNode>("KeepRunningUntilFailure");
   registerNodeType<RepeatNode>("Repeat");
   registerNodeType<TimeoutNode>("Timeout");
-  registerNodeType<DelayNode>("Delay");
+  registerBuilder(
+      CreateManifest<DelayNode>("Delay"),
+      [timers = _p->shared_timers](const std::string& name, const NodeConfig& config) {
+        return std::make_unique<DelayNode>(name, config, timers->get());
+      });
   registerNodeType<RunOnceNode>("RunOnce");
 
   registerNodeType<ForceSuccessNode>("ForceSuccess");
@@ -150,7 +192,11 @@ BehaviorTreeFactory::BehaviorTreeFactory() : _p(new PImpl)
   registerNodeType<ScriptNode>("Script");
   registerNodeType<ScriptCondition>("ScriptCondition");
   registerNodeType<SetBlackboardNode>("SetBlackboard");
-  registerNodeType<SleepNode>("Sleep");
+  registerBuilder(
+      CreateManifest<SleepNode>("Sleep"),
+      [timers = _p->shared_timers](const std::string& name, const NodeConfig& config) {
+        return std::make_unique<SleepNode>(name, config, timers->get());
+      });
   registerNodeType<UnsetBlackboardNode>("UnsetBlackboard");
 
   registerNodeType<SubTreeNode>("SubTree");
@@ -185,6 +231,11 @@ BehaviorTreeFactory::~BehaviorTreeFactory() = default;
 BehaviorTreeFactory::BehaviorTreeFactory(BehaviorTreeFactory&& other) noexcept = default;
 BehaviorTreeFactory&
 BehaviorTreeFactory::operator=(BehaviorTreeFactory&& other) noexcept = default;
+
+void BehaviorTreeFactory::useSharedTimerThread(bool enable)
+{
+  _p->shared_timers->setEnabled(enable);
+}
 
 bool BehaviorTreeFactory::unregisterBuilder(const std::string& ID)
 {
@@ -378,7 +429,7 @@ std::unique_ptr<TreeNode> BehaviorTreeFactory::instantiateTreeNode(
   }
 
   node->setRegistrationID(ID);
-  node->config().enums = _p->scripting_enums;
+  node->mutableConfig().enums = _p->scripting_enums;
 
   auto AssignConditions = [](auto& conditions, auto& executors) {
     for(const auto& [cond_id, script] : conditions)
@@ -393,8 +444,16 @@ std::unique_ptr<TreeNode> BehaviorTreeFactory::instantiateTreeNode(
       }
     }
   };
-  AssignConditions(config.pre_conditions, node->preConditionsScripts());
-  AssignConditions(config.post_conditions, node->postConditionsScripts());
+  // Only touch the scripts when there are some: TreeNode skips checking them
+  // on every tick if they were never requested.
+  if(!config.pre_conditions.empty())
+  {
+    AssignConditions(config.pre_conditions, node->preConditionsScripts());
+  }
+  if(!config.post_conditions.empty())
+  {
+    AssignConditions(config.post_conditions, node->postConditionsScripts());
+  }
 
   return node;
 }
@@ -606,9 +665,11 @@ void Tree::remapManifestPointers()
         auto it = manifests.find(old_manifest->registration_ID);
         if(it != manifests.end())
         {
-          node->config().manifest = &(it->second);
+          node->setManifest(&(it->second));
         }
       }
+      // the configuration is final: resolve the ports, next to each other
+      node->resolvePorts();
     }
   }
 }
@@ -616,6 +677,9 @@ void Tree::remapManifestPointers()
 void Tree::initialize()
 {
   wake_up_ = std::make_shared<WakeUpSignal>();
+  root_ = (subtrees.empty() || subtrees.front()->nodes.empty()) ?
+              nullptr :
+              subtrees.front()->nodes.front();
   for(auto& subtree : subtrees)
   {
     for(auto& node : subtree->nodes)
@@ -719,12 +783,13 @@ NodeStatus Tree::tickRoot(TickOption opt, std::chrono::milliseconds sleep_time)
 {
   NodeStatus status = NodeStatus::IDLE;
 
-  if(!wake_up_)
+  if(!wake_up_ || !root_)
   {
     initialize();
   }
 
-  if(rootNode() == nullptr)
+  TreeNode* root = root_.get();
+  if(root == nullptr)
   {
     throw RuntimeError("Empty Tree");
   }
@@ -732,19 +797,19 @@ NodeStatus Tree::tickRoot(TickOption opt, std::chrono::milliseconds sleep_time)
   while(status == NodeStatus::IDLE ||
         (opt == TickOption::WHILE_RUNNING && status == NodeStatus::RUNNING))
   {
-    status = rootNode()->executeTick();
+    status = root->executeTick();
 
     // Inner loop. The previous tick might have triggered the wake-up
     // in this case, unless TickOption::EXACTLY_ONCE, we tick again
     while(opt != TickOption::EXACTLY_ONCE && status == NodeStatus::RUNNING &&
           wake_up_->waitFor(std::chrono::milliseconds(0)))
     {
-      status = rootNode()->executeTick();
+      status = root->executeTick();
     }
 
     if(isStatusCompleted(status))
     {
-      rootNode()->resetStatus();
+      root->resetStatus();
     }
     if(status == NodeStatus::RUNNING && sleep_time.count() > 0)
     {

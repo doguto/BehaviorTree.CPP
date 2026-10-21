@@ -21,6 +21,7 @@ set(BT_TESTS
   gtest_any.cpp
   gtest_basic_types.cpp
   gtest_blackboard.cpp
+  gtest_blackboard_remapped_set.cpp
   gtest_coroutines.cpp
   gtest_decorator.cpp
   gtest_enums.cpp
@@ -45,6 +46,11 @@ set(BT_TESTS
   gtest_substitution.cpp
   gtest_subtree.cpp
   gtest_switch.cpp
+  gtest_get_input.cpp
+  gtest_script_reload.cpp
+  gtest_tick_hooks.cpp
+  gtest_shared_timer.cpp
+  gtest_port_table.cpp
   gtest_tree.cpp
   gtest_try_catch.cpp
   gtest_exception_tracking.cpp

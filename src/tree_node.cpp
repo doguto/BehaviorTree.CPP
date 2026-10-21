@@ -173,17 +173,23 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
   {}
 
   //---------- hot: used by every tick ----------
-  mutable std::mutex state_mutex;
 
-  NodeStatus status = NodeStatus::IDLE;
+  // The status is read and written without lock. state_mutex is only used to
+  // wake up the threads blocked in waitValidStatus(), see notifyStatusChange().
+  std::atomic<NodeStatus> status{ NodeStatus::IDLE };
+
+  mutable std::mutex state_mutex;
 
   // True when at least one injected callback is set. Written while holding
   // callback_injection_mutex; lets executeTick() skip that mutex otherwise.
   std::atomic<bool> has_injected_callbacks{ false };
 
-  // Number of threads blocked in waitValidStatus(). Guarded by state_mutex,
-  // it lets setStatus()/resetStatus() skip notify_all() when nobody waits.
-  int status_waiters = 0;
+  // Number of threads blocked in waitValidStatus(): lets setStatus() and
+  // resetStatus() skip state_mutex and notify_all() when nobody waits.
+  // A waiter increments it, then reads the status; a writer writes the status,
+  // then reads it (both seq_cst): either the waiter sees the new status, or the
+  // writer sees the waiter and notifies it under state_mutex.
+  std::atomic<int> status_waiters{ 0 };
 
   StatusChangeSignal state_change_signal;
 
@@ -209,8 +215,7 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
   //---------- rarely used: allocated on first use ----------
 
   // Created by the first waitValidStatus(), while holding state_mutex, and never
-  // destroyed before the node: a thread that saw status_waiters > 0 under
-  // state_mutex can use it.
+  // destroyed before the node.
   std::unique_ptr<std::condition_variable> state_condition_variable;
 
   struct InjectedCallbacks
@@ -252,14 +257,18 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
     return *scripts;
   }
 
-  // Called after a status change, outside state_mutex.
+  // Called after a status change.
   // The clock is read only if there is a subscriber to receive it.
-  void notifyStatusChange(TreeNode& node, NodeStatus prev_status, NodeStatus new_status,
-                          bool has_waiters)
+  void notifyStatusChange(TreeNode& node, NodeStatus prev_status, NodeStatus new_status)
   {
-    if(has_waiters)
+    if(status_waiters.load(std::memory_order_seq_cst) > 0)
     {
-      state_condition_variable->notify_all();
+      // Taking the mutex guarantees that a waiter that read the old status is
+      // now blocked in wait(), and will get the notification.
+      std::unique_lock lock(state_mutex);
+      auto* condition_variable = state_condition_variable.get();
+      lock.unlock();
+      condition_variable->notify_all();
     }
     if(!state_change_signal.empty())
     {
@@ -322,7 +331,7 @@ TreeNode::~TreeNode() = default;
 
 NodeStatus TreeNode::executeTick()
 {
-  auto new_status = _p->status;
+  auto new_status = status();
   PreTickCallback pre_tick;
   PostTickCallback post_tick;
   TickMonitorCallback monitor_tick;
@@ -357,7 +366,7 @@ NodeStatus TreeNode::executeTick()
   {
     // injected pre-callback
     bool substituted = false;
-    if(pre_tick && !isStatusCompleted(_p->status))
+    if(pre_tick && !isStatusCompleted(status()))
     {
       auto override_status = pre_tick(*this);
       if(isStatusCompleted(override_status))
@@ -453,17 +462,11 @@ void TreeNode::setStatus(NodeStatus new_status)
                        "If you know what you are doing (?) use resetStatus() instead.");
   }
 
-  NodeStatus prev_status = NodeStatus::IDLE;
-  bool has_waiters = false;
-  {
-    const std::unique_lock<std::mutex> UniqueLock(_p->state_mutex);
-    prev_status = _p->status;
-    _p->status = new_status;
-    has_waiters = _p->status_waiters > 0;
-  }
+  const NodeStatus prev_status =
+      _p->status.exchange(new_status, std::memory_order_seq_cst);
   if(prev_status != new_status)
   {
-    _p->notifyStatusChange(*this, prev_status, new_status, has_waiters);
+    _p->notifyStatusChange(*this, prev_status, new_status);
   }
 }
 
@@ -508,7 +511,8 @@ Expected<NodeStatus> TreeNode::checkPreConditions()
 
     // _failureIf, _successIf, _skipIf: only checked when IDLE or SKIPPED
     // _while: checked here AND also when RUNNING (see below)
-    if(_p->status == NodeStatus::IDLE || _p->status == NodeStatus::SKIPPED)
+    const NodeStatus current = status();
+    if(current == NodeStatus::IDLE || current == NodeStatus::SKIPPED)
     {
       // what to do if the condition is true
       if(parse_executor(env()).cast<bool>())
@@ -532,7 +536,7 @@ Expected<NodeStatus> TreeNode::checkPreConditions()
         return NodeStatus::SKIPPED;
       }
     }
-    else if(_p->status == NodeStatus::RUNNING && preID == PreCond::WHILE_TRUE)
+    else if(current == NodeStatus::RUNNING && preID == PreCond::WHILE_TRUE)
     {
       // _while is the ONLY precondition checked while RUNNING.
       // If the condition becomes false, halt the node and return SKIPPED.
@@ -574,25 +578,17 @@ void TreeNode::checkPostConditions(NodeStatus status)
 
 void TreeNode::resetStatus()
 {
-  NodeStatus prev_status = NodeStatus::IDLE;
-  bool has_waiters = false;
-  {
-    const std::unique_lock<std::mutex> lock(_p->state_mutex);
-    prev_status = _p->status;
-    _p->status = NodeStatus::IDLE;
-    has_waiters = _p->status_waiters > 0;
-  }
-
+  const NodeStatus prev_status =
+      _p->status.exchange(NodeStatus::IDLE, std::memory_order_seq_cst);
   if(prev_status != NodeStatus::IDLE)
   {
-    _p->notifyStatusChange(*this, prev_status, NodeStatus::IDLE, has_waiters);
+    _p->notifyStatusChange(*this, prev_status, NodeStatus::IDLE);
   }
 }
 
 NodeStatus TreeNode::status() const
 {
-  const std::lock_guard<std::mutex> lock(_p->state_mutex);
-  return _p->status;
+  return _p->status.load(std::memory_order_acquire);
 }
 
 NodeStatus TreeNode::waitValidStatus()
@@ -603,13 +599,13 @@ NodeStatus TreeNode::waitValidStatus()
   {
     _p->state_condition_variable = std::make_unique<std::condition_variable>();
   }
-  _p->status_waiters++;
-  while(isHalted())
+  _p->status_waiters.fetch_add(1, std::memory_order_seq_cst);
+  while(_p->status.load(std::memory_order_seq_cst) == NodeStatus::IDLE)
   {
     _p->state_condition_variable->wait(lock);
   }
-  _p->status_waiters--;
-  return _p->status;
+  _p->status_waiters.fetch_sub(1, std::memory_order_seq_cst);
+  return _p->status.load(std::memory_order_acquire);
 }
 
 const std::string& TreeNode::name() const
@@ -619,7 +615,7 @@ const std::string& TreeNode::name() const
 
 bool TreeNode::isHalted() const
 {
-  return _p->status == NodeStatus::IDLE;
+  return status() == NodeStatus::IDLE;
 }
 
 TreeNode::StatusChangeSubscriber

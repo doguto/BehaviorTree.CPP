@@ -28,6 +28,16 @@ namespace BT
 
 namespace
 {
+// Bits of TreeNode::tick_flags_: they tell a tick whether it must look at the
+// rarely used parts of the node (in PImpl).
+enum TickFlags : uint8_t
+{
+  kHasCallbacks = 1,    // injected pre/post tick or monitor callbacks
+  kHasScripts = 2,      // pre/post condition scripts
+  kHasWaiters = 4,      // threads blocked in waitValidStatus()
+  kHasSubscribers = 8,  // subscribeToStatusChange() was called
+};
+
 // Allocator for the data of the nodes (TreeNode::PImpl and its condition scripts).
 //
 // The nodes of a tree are created one after the other and ticked in the same
@@ -172,28 +182,11 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
     : config(std::move(config)), name(std::move(name))
   {}
 
-  //---------- hot: used by every tick ----------
+  //---------- hot: used by every tick, all in the first cache line ----------
 
-  // The status is read and written without lock. state_mutex is only used to
-  // wake up the threads blocked in waitValidStatus(), see notifyStatusChange().
-  std::atomic<NodeStatus> status{ NodeStatus::IDLE };
-
-  mutable std::mutex state_mutex;
-
-  // True when at least one injected callback is set. Written while holding
-  // callback_injection_mutex; lets executeTick() skip that mutex otherwise.
-  std::atomic<bool> has_injected_callbacks{ false };
-
-  // Number of threads blocked in waitValidStatus(): lets setStatus() and
-  // resetStatus() skip state_mutex and notify_all() when nobody waits.
-  // A waiter increments it, then reads the status; a writer writes the status,
-  // then reads it (both seq_cst): either the waiter sees the new status, or the
-  // writer sees the waiter and notifies it under state_mutex.
-  std::atomic<int> status_waiters{ 0 };
-
-  StatusChangeSignal state_change_signal;
-
-  std::shared_ptr<WakeUpSignal> wake_up;
+  // Number of threads blocked in waitValidStatus(). Guarded by state_mutex.
+  // While it is not zero, the flag kHasWaiters is set.
+  int status_waiters = 0;
 
   // Pre/post condition scripts. Allocated only when requested by
   // preConditionsScripts() / postConditionsScripts() (the only way to set them):
@@ -204,6 +197,13 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
     PostScripts post;
   };
   std::unique_ptr<ConditionScripts> scripts;
+
+  StatusChangeSignal state_change_signal;
+
+  std::shared_ptr<WakeUpSignal> wake_up;
+
+  //---------- used when a thread waits for the status ----------
+  mutable std::mutex state_mutex;
 
   //---------- used by ports and introspection ----------
   NodeConfig config;
@@ -240,12 +240,10 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
   }
 
   // Call while holding callback_injection_mutex
-  void updateInjectedCallbacksFlag()
+  [[nodiscard]] bool hasInjectedCallbacks() const
   {
-    has_injected_callbacks.store(
-        callbacks &&
-            (callbacks->pre_tick || callbacks->post_tick || callbacks->tick_monitor),
-        std::memory_order_release);
+    return callbacks &&
+           (callbacks->pre_tick || callbacks->post_tick || callbacks->tick_monitor);
   }
 
   ConditionScripts& conditionScripts()
@@ -257,11 +255,12 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
     return *scripts;
   }
 
-  // Called after a status change.
-  // The clock is read only if there is a subscriber to receive it.
-  void notifyStatusChange(TreeNode& node, NodeStatus prev_status, NodeStatus new_status)
+  // Called after a status change, if `flags` (TreeNode::tick_flags_) say that
+  // there are waiters or subscribers.
+  void notifyStatusChange(TreeNode& node, NodeStatus prev_status, NodeStatus new_status,
+                          uint8_t flags)
   {
-    if(status_waiters.load(std::memory_order_seq_cst) > 0)
+    if((flags & kHasWaiters) != 0)
     {
       // Taking the mutex guarantees that a waiter that read the old status is
       // now blocked in wait(), and will get the notification.
@@ -270,7 +269,7 @@ struct alignas(64) TreeNode::PImpl final : ArenaAllocated
       lock.unlock();
       condition_variable->notify_all();
     }
-    if(!state_change_signal.empty())
+    if((flags & kHasSubscribers) != 0 && !state_change_signal.empty())
     {
       state_change_signal.notify(std::chrono::high_resolution_clock::now(), node,
                                  prev_status, new_status);
@@ -318,24 +317,75 @@ TreeNode::TreeNode(std::string name, NodeConfig config)
   : _p(new PImpl(std::move(name), std::move(config)))
 {}
 
-TreeNode::TreeNode(TreeNode&& other) noexcept : _p(std::move(other._p))
+TreeNode::TreeNode(TreeNode&& other) noexcept
+  : _p(std::move(other._p))
+  , status_(other.status_.load())
+  , tick_flags_(other.tick_flags_.load())
 {}
 
 TreeNode& TreeNode::operator=(TreeNode&& other) noexcept
 {
   this->_p = std::move(other._p);
+  status_.store(other.status_.load());
+  tick_flags_.store(other.tick_flags_.load());
   return *this;
+}
+
+void TreeNode::notifyStatusChange(NodeStatus prev_status, NodeStatus new_status)
+{
+  const uint8_t flags = tick_flags_.load(std::memory_order_seq_cst);
+  if((flags & (kHasWaiters | kHasSubscribers)) != 0)
+  {
+    _p->notifyStatusChange(*this, prev_status, new_status, flags);
+  }
+}
+
+void TreeNode::updateCallbacksFlag()
+{
+  if(_p->hasInjectedCallbacks())
+  {
+    tick_flags_.fetch_or(kHasCallbacks, std::memory_order_release);
+  }
+  else
+  {
+    tick_flags_.fetch_and(uint8_t(~kHasCallbacks), std::memory_order_release);
+  }
 }
 
 TreeNode::~TreeNode() = default;
 
 NodeStatus TreeNode::executeTick()
 {
+  // Fast path, for the nodes without injected callbacks nor condition scripts:
+  // the same as the general case below, minus what doesn't apply.
+  const uint8_t flags = tick_flags_.load(std::memory_order_acquire);
+  if((flags & (kHasCallbacks | kHasScripts)) == 0)
+  {
+    NodeStatus new_status;
+    try
+    {
+      new_status = tick();
+    }
+    catch(const NodeExecutionError&)
+    {
+      throw;
+    }
+    catch(const std::exception& ex)
+    {
+      throw NodeExecutionError({ name(), fullPath(), registrationName() }, ex.what());
+    }
+    if(new_status != NodeStatus::SKIPPED)
+    {
+      setStatus(new_status);
+    }
+    return new_status;
+  }
+
   auto new_status = status();
   PreTickCallback pre_tick;
   PostTickCallback post_tick;
   TickMonitorCallback monitor_tick;
-  if(_p->has_injected_callbacks.load(std::memory_order_acquire))
+  if((flags & kHasCallbacks) != 0)
   {
     const std::scoped_lock lk(_p->callback_injection_mutex);
     if(const auto& callbacks = _p->callbacks)
@@ -441,7 +491,7 @@ void TreeNode::haltNode()
 {
   halt();
 
-  if(!_p->scripts)
+  if((tick_flags_.load(std::memory_order_acquire) & kHasScripts) == 0)
   {
     return;
   }
@@ -462,22 +512,30 @@ void TreeNode::setStatus(NodeStatus new_status)
                        "If you know what you are doing (?) use resetStatus() instead.");
   }
 
-  const NodeStatus prev_status =
-      _p->status.exchange(new_status, std::memory_order_seq_cst);
+  // Common case (e.g. a node still RUNNING): nothing to write nor notify.
+  if(status_.load(std::memory_order_relaxed) == new_status)
+  {
+    return;
+  }
+  const NodeStatus prev_status = status_.exchange(new_status, std::memory_order_seq_cst);
   if(prev_status != new_status)
   {
-    _p->notifyStatusChange(*this, prev_status, new_status);
+    notifyStatusChange(prev_status, new_status);
   }
 }
 
 TreeNode::PreScripts& TreeNode::preConditionsScripts()
 {
-  return _p->conditionScripts().pre;
+  auto& scripts = _p->conditionScripts().pre;
+  tick_flags_.fetch_or(kHasScripts, std::memory_order_acq_rel);
+  return scripts;
 }
 
 TreeNode::PostScripts& TreeNode::postConditionsScripts()
 {
-  return _p->conditionScripts().post;
+  auto& scripts = _p->conditionScripts().post;
+  tick_flags_.fetch_or(kHasScripts, std::memory_order_acq_rel);
+  return scripts;
 }
 
 Expected<NodeStatus> TreeNode::checkPreConditions()
@@ -578,17 +636,17 @@ void TreeNode::checkPostConditions(NodeStatus status)
 
 void TreeNode::resetStatus()
 {
+  // Common case (e.g. the children reset by their parent): already IDLE.
+  if(status_.load(std::memory_order_relaxed) == NodeStatus::IDLE)
+  {
+    return;
+  }
   const NodeStatus prev_status =
-      _p->status.exchange(NodeStatus::IDLE, std::memory_order_seq_cst);
+      status_.exchange(NodeStatus::IDLE, std::memory_order_seq_cst);
   if(prev_status != NodeStatus::IDLE)
   {
-    _p->notifyStatusChange(*this, prev_status, NodeStatus::IDLE);
+    notifyStatusChange(prev_status, NodeStatus::IDLE);
   }
-}
-
-NodeStatus TreeNode::status() const
-{
-  return _p->status.load(std::memory_order_acquire);
 }
 
 NodeStatus TreeNode::waitValidStatus()
@@ -599,13 +657,21 @@ NodeStatus TreeNode::waitValidStatus()
   {
     _p->state_condition_variable = std::make_unique<std::condition_variable>();
   }
-  _p->status_waiters.fetch_add(1, std::memory_order_seq_cst);
-  while(_p->status.load(std::memory_order_seq_cst) == NodeStatus::IDLE)
+  // Set the flag, then read the status (both seq_cst). A writer writes the
+  // status, then reads the flag: either we see the new status, or the writer
+  // sees the flag and notifies us after taking state_mutex (that we hold
+  // until wait() releases it).
+  _p->status_waiters++;
+  tick_flags_.fetch_or(kHasWaiters, std::memory_order_seq_cst);
+  while(status_.load(std::memory_order_seq_cst) == NodeStatus::IDLE)
   {
     _p->state_condition_variable->wait(lock);
   }
-  _p->status_waiters.fetch_sub(1, std::memory_order_seq_cst);
-  return _p->status.load(std::memory_order_acquire);
+  if(--_p->status_waiters == 0)
+  {
+    tick_flags_.fetch_and(uint8_t(~kHasWaiters), std::memory_order_seq_cst);
+  }
+  return status_.load(std::memory_order_acquire);
 }
 
 const std::string& TreeNode::name() const
@@ -613,14 +679,10 @@ const std::string& TreeNode::name() const
   return _p->name;
 }
 
-bool TreeNode::isHalted() const
-{
-  return status() == NodeStatus::IDLE;
-}
-
 TreeNode::StatusChangeSubscriber
 TreeNode::subscribeToStatusChange(TreeNode::StatusChangeCallback callback)
 {
+  tick_flags_.fetch_or(kHasSubscribers, std::memory_order_acq_rel);
   return _p->state_change_signal.subscribe(std::move(callback));
 }
 
@@ -628,21 +690,21 @@ void TreeNode::setPreTickFunction(PreTickCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
   _p->injectedCallbacks().pre_tick = std::move(callback);
-  _p->updateInjectedCallbacksFlag();
+  updateCallbacksFlag();
 }
 
 void TreeNode::setPostTickFunction(PostTickCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
   _p->injectedCallbacks().post_tick = std::move(callback);
-  _p->updateInjectedCallbacksFlag();
+  updateCallbacksFlag();
 }
 
 void TreeNode::setTickMonitorCallback(TickMonitorCallback callback)
 {
   const std::unique_lock lk(_p->callback_injection_mutex);
   _p->injectedCallbacks().tick_monitor = std::move(callback);
-  _p->updateInjectedCallbacksFlag();
+  updateCallbacksFlag();
 }
 
 uint16_t TreeNode::UID() const

@@ -83,7 +83,9 @@ it with `--models`):
 - `Delay` / `Sleep` wait `--delay-scale` ticks per millisecond (default 0.1)
   instead of wall-clock time, so the number of samples spent waiting does not
   depend on the tick speed. Delays used as timeouts still last longer than
-  the action stubs. `--real-delays` keeps the real nodes.
+  the action stubs. `--real-delays` keeps the real nodes; `--shared-timer`
+  then makes them share one timer thread
+  (`BehaviorTreeFactory::useSharedTimerThread()`).
 
 Keys referenced by ports and scripts are seeded with 0. Data-dependent branches
 (Switch, Precondition, loop bounds) may need other values to go anywhere

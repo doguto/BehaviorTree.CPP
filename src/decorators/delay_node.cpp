@@ -7,6 +7,7 @@ namespace BT
 {
 DelayNode::DelayNode(const std::string& name, unsigned milliseconds)
   : DecoratorNode(name, {})
+  , timer_(std::make_unique<TimerQueue<>>())
   , timer_id_(0)
   , msec_(milliseconds)
   , read_parameter_from_ports_(false)
@@ -15,13 +16,31 @@ DelayNode::DelayNode(const std::string& name, unsigned milliseconds)
 }
 
 DelayNode::DelayNode(const std::string& name, const NodeConfig& config)
-  : DecoratorNode(name, config), timer_id_(0), msec_(0), read_parameter_from_ports_(true)
+  : DelayNode(name, config, nullptr)
+{}
+
+DelayNode::DelayNode(const std::string& name, const NodeConfig& config,
+                     std::shared_ptr<SharedTimerQueue> shared_timer)
+  : DecoratorNode(name, config)
+  , timer_(shared_timer ? nullptr : std::make_unique<TimerQueue<>>())
+  , shared_timer_(std::move(shared_timer))
+  , timer_id_(0)
+  , msec_(0)
+  , read_parameter_from_ports_(true)
 {}
 
 void DelayNode::halt()
 {
   delay_started_ = false;
-  timer_.cancelAll();
+  if(shared_timer_)
+  {
+    // the callback is not running anymore when cancel() returns
+    shared_timer_->cancel(timer_id_);
+  }
+  else
+  {
+    timer_->cancelAll();
+  }
   DecoratorNode::halt();
 }
 
@@ -42,14 +61,25 @@ NodeStatus DelayNode::tick()
     delay_started_ = true;
     setStatus(NodeStatus::RUNNING);
 
-    timer_id_ = timer_.add(std::chrono::milliseconds(msec_), [this](bool aborted) {
-      const std::unique_lock<std::mutex> lk(delay_mutex_);
-      delay_complete_ = (!aborted);
-      if(!aborted)
-      {
+    if(shared_timer_)
+    {
+      timer_id_ = shared_timer_->add(std::chrono::milliseconds(msec_), [this]() {
+        const std::unique_lock<std::mutex> lk(delay_mutex_);
+        delay_complete_ = true;
         emitWakeUpSignal();
-      }
-    });
+      });
+    }
+    else
+    {
+      timer_id_ = timer_->add(std::chrono::milliseconds(msec_), [this](bool aborted) {
+        const std::unique_lock<std::mutex> lk(delay_mutex_);
+        delay_complete_ = (!aborted);
+        if(!aborted)
+        {
+          emitWakeUpSignal();
+        }
+      });
+    }
   }
 
   const std::unique_lock<std::mutex> lk(delay_mutex_);

@@ -204,6 +204,10 @@ private:
   friend class BehaviorTreeFactory;
 
   std::shared_ptr<WakeUpSignal> wake_up_;
+  // Root node, cached by initialize(): finding it in subtrees at every tick
+  // means following 4 pointers (cache misses when the tree is not in cache).
+  // Shared ownership, so that it can't dangle if subtrees is modified.
+  TreeNode::Ptr root_;
 
   enum TickOption
   {

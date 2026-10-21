@@ -429,7 +429,7 @@ std::unique_ptr<TreeNode> BehaviorTreeFactory::instantiateTreeNode(
   }
 
   node->setRegistrationID(ID);
-  node->config().enums = _p->scripting_enums;
+  node->mutableConfig().enums = _p->scripting_enums;
 
   auto AssignConditions = [](auto& conditions, auto& executors) {
     for(const auto& [cond_id, script] : conditions)
@@ -665,9 +665,11 @@ void Tree::remapManifestPointers()
         auto it = manifests.find(old_manifest->registration_ID);
         if(it != manifests.end())
         {
-          node->config().manifest = &(it->second);
+          node->setManifest(&(it->second));
         }
       }
+      // the configuration is final: resolve the ports, next to each other
+      node->resolvePorts();
     }
   }
 }

@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD 17)
 option(BTCPP_SHARED_LIBS "Build shared libraries" ON)
 option(BTCPP_BUILD_TOOLS "Build commandline tools" ON)
 option(BTCPP_EXAMPLES   "Build tutorials and examples" ON)
+option(BTCPP_BUILD_BENCHMARKS "Build the performance/memory benchmarks" OFF)
 option(BUILD_TESTING "Build the unit tests" ON)
 option(BTCPP_GROOT_INTERFACE "Add Groot2 connection. Requires ZeroMQ" ON)
 option(BTCPP_SQLITE_LOGGING "Add SQLite logging." ON)
@@ -297,6 +298,10 @@ endif()
 
 if(BTCPP_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(BTCPP_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
 
 ######################################################

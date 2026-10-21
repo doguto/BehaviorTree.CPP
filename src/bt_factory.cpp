@@ -393,8 +393,16 @@ std::unique_ptr<TreeNode> BehaviorTreeFactory::instantiateTreeNode(
       }
     }
   };
-  AssignConditions(config.pre_conditions, node->preConditionsScripts());
-  AssignConditions(config.post_conditions, node->postConditionsScripts());
+  // Only touch the scripts when there are some: TreeNode skips checking them
+  // on every tick if they were never requested.
+  if(!config.pre_conditions.empty())
+  {
+    AssignConditions(config.pre_conditions, node->preConditionsScripts());
+  }
+  if(!config.post_conditions.empty())
+  {
+    AssignConditions(config.post_conditions, node->postConditionsScripts());
+  }
 
   return node;
 }

@@ -23,6 +23,7 @@
 #include <charconv>
 #include <exception>
 #include <map>
+#include <new>
 #include <optional>
 #include <utility>
 
@@ -175,6 +176,24 @@ public:
   TreeNode& operator=(TreeNode&& other) noexcept;
 
   virtual ~TreeNode();
+
+  // Nodes (including derived classes) are allocated next to each other and to
+  // their internal data, in creation order, to be cache friendly when ticked.
+  // A node allocated with these must be deleted through them: use `new`/`delete`
+  // or std::unique_ptr, as usual.
+  static void* operator new(std::size_t size);
+  static void* operator new(std::size_t size, std::align_val_t align);
+  static void operator delete(void* ptr, std::size_t size) noexcept;
+  static void operator delete(void* ptr, std::size_t size,
+                              std::align_val_t align) noexcept;
+  // the other usual forms
+  static void* operator new(std::size_t size, const std::nothrow_t&) noexcept;
+  static void* operator new(std::size_t, void* where) noexcept
+  {
+    return where;
+  }
+  static void operator delete(void*, void*) noexcept
+  {}
 
   /// The method that should be used to invoke tick() and setStatus();
   virtual BT::NodeStatus executeTick();

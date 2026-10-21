@@ -232,3 +232,77 @@ TEST(TickHooks, WaitValidStatusStress)
     tree.haltTree();
   }
 }
+
+TEST(TickHooks, WakeUpSignalWithoutTimeout)
+{
+  WakeUpSignal signal;
+  EXPECT_FALSE(signal.waitFor(std::chrono::microseconds(0)));
+  signal.emitSignal();
+  // the signal is consumed by the first check
+  EXPECT_TRUE(signal.waitFor(std::chrono::microseconds(0)));
+  EXPECT_FALSE(signal.waitFor(std::chrono::microseconds(0)));
+
+  // a waiter with a timeout is still woken up by another thread
+  auto waiter = std::async(std::launch::async,
+                           [&] { return signal.waitFor(std::chrono::seconds(5)); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  signal.emitSignal();
+  EXPECT_TRUE(waiter.get());
+}
+
+namespace
+{
+// RUNNING, and asks to be ticked again immediately the first `wakeups` times.
+class WakeUpTwice : public StatefulActionNode
+{
+public:
+  WakeUpTwice(const std::string& name, const NodeConfig& config, int* ticks)
+    : StatefulActionNode(name, config), ticks_(ticks)
+  {}
+  static PortsList providedPorts()
+  {
+    return {};
+  }
+  NodeStatus onStart() override
+  {
+    return onRunning();
+  }
+  NodeStatus onRunning() override
+  {
+    if(++(*ticks_) <= 2)
+    {
+      emitWakeUpSignal();
+    }
+    return NodeStatus::RUNNING;
+  }
+  void onHalted() override
+  {}
+
+private:
+  int* ticks_;
+};
+}  // namespace
+
+TEST(TickHooks, TickOnceTicksAgainWhenWokenUp)
+{
+  BehaviorTreeFactory factory;
+  int ticks = 0;
+  factory.registerNodeType<WakeUpTwice>("WakeUpTwice", &ticks);
+  auto tree = factory.createTreeFromText(R"(
+<root BTCPP_format="4">
+  <BehaviorTree ID="Main">
+    <Sequence>
+      <WakeUpTwice/>
+    </Sequence>
+  </BehaviorTree>
+</root>)");
+
+  ASSERT_EQ(tree.tickOnce(), NodeStatus::RUNNING);
+  EXPECT_EQ(ticks, 3);
+  // no pending signal: a single tick
+  ASSERT_EQ(tree.tickOnce(), NodeStatus::RUNNING);
+  EXPECT_EQ(ticks, 4);
+  ASSERT_EQ(tree.tickExactlyOnce(), NodeStatus::RUNNING);
+  EXPECT_EQ(ticks, 5);
+  tree.haltTree();
+}

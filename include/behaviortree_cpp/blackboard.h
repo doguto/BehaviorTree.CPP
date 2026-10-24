@@ -121,6 +121,21 @@ public:
 
   void addSubtreeRemapping(StringView internal, StringView external);
 
+  /// Remappings added with addSubtreeRemapping(): internal key -> key in the parent.
+  [[nodiscard]] const std::unordered_map<std::string, std::string>&
+  subtreeRemappings() const
+  {
+    return internal_to_external_;
+  }
+
+  [[nodiscard]] bool autoRemappingEnabled() const
+  {
+    return autoremapping_;
+  }
+
+  /// Entry stored in this blackboard only, without remapping or parent lookup.
+  [[nodiscard]] std::shared_ptr<Entry> getLocalEntry(const std::string& key) const;
+
   void debugMessage() const;
 
   [[nodiscard]] std::vector<StringView> getKeys() const;

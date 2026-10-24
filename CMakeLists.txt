@@ -153,6 +153,7 @@ list(APPEND BT_SOURCE
     src/condition_node.cpp
     src/control_node.cpp
     src/shared_library.cpp
+    src/symbol_table.cpp
     src/tree_node.cpp
     src/script_parser.cpp
     src/script_tokenizer.cpp

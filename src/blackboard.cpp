@@ -89,6 +89,13 @@ std::shared_ptr<Blackboard::Entry> Blackboard::getEntry(const std::string& key)
   return static_cast<const Blackboard&>(*this).getEntry(key);
 }
 
+std::shared_ptr<Blackboard::Entry> Blackboard::getLocalEntry(const std::string& key) const
+{
+  const std::shared_lock<std::shared_mutex> storage_lock(storage_mutex_);
+  auto it = storage_.find(key);
+  return (it != storage_.end()) ? it->second : nullptr;
+}
+
 const TypeInfo* Blackboard::entryInfo(const std::string& key)
 {
   auto entry = getEntry(key);
